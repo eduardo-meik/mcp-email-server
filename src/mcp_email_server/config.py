@@ -1,7 +1,8 @@
+import json
 from functools import lru_cache
 from urllib.parse import urlparse
 
-from pydantic import Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +13,36 @@ PLACEHOLDER_VALUES = {
     "agent@example.com",
     "https://your-project.supabase.co",
 }
+
+
+class EmailAccountConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    account_name: str
+    mailbox_id: str | None = None
+    imap_host: str | None = None
+    imap_port: int | None = None
+    imap_username: str | None = None
+    imap_password: SecretStr | None = None
+    imap_mailbox: str | None = None
+    smtp_host: str | None = None
+    smtp_port: int | None = None
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_from_address: str | None = None
+    smtp_use_tls: bool | None = None
+    smtp_starttls: bool | None = None
+
+    def resolved_mailbox_id(self) -> str:
+        if self.mailbox_id and self.mailbox_id.strip():
+            return self.mailbox_id.strip()
+        return self.account_name.strip()
+
+    def resolved_email_address(self) -> str:
+        for candidate in (self.imap_username, self.smtp_from_address, self.smtp_username):
+            if candidate and candidate.strip():
+                return candidate.strip().lower()
+        return ""
 
 
 class Settings(BaseSettings):
@@ -26,6 +57,7 @@ class Settings(BaseSettings):
     env: str = "development"
     log_level: str = "INFO"
     poll_batch_size: int = 25
+    accounts_json: str | None = None
 
     imap_host: str | None = None
     imap_port: int = 993
@@ -80,6 +112,63 @@ class Settings(BaseSettings):
 
     def missing_openrouter_config(self) -> list[str]:
         return [] if not self._is_missing_secret(self.openrouter_api_key) else ["MCP_EMAIL_OPENROUTER_API_KEY"]
+
+    def account_configs(self) -> list[EmailAccountConfig]:
+        if self._is_missing_value(self.accounts_json):
+            return [self._default_account_config()]
+
+        try:
+            raw_accounts = json.loads(self.accounts_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("MCP_EMAIL_ACCOUNTS_JSON must be valid JSON") from exc
+
+        if not isinstance(raw_accounts, list) or not raw_accounts:
+            raise ValueError("MCP_EMAIL_ACCOUNTS_JSON must contain a non-empty JSON array")
+
+        return [EmailAccountConfig.model_validate(item) for item in raw_accounts]
+
+    def default_account_name(self) -> str:
+        return self.account_configs()[0].account_name
+
+    def resolve_account_config(self, account_name: str | None = None) -> EmailAccountConfig:
+        if account_name is None or not account_name.strip():
+            return self.account_configs()[0]
+
+        normalized = account_name.strip().lower()
+        for config in self.account_configs():
+            aliases = {
+                config.account_name.lower(),
+                config.resolved_mailbox_id().lower(),
+            }
+            email_address = config.resolved_email_address()
+            if email_address:
+                aliases.add(email_address)
+            if normalized in aliases:
+                return config
+
+        raise ValueError(f"Unknown account_name: {account_name}")
+
+    def for_account(self, account_name: str | None = None) -> "Settings":
+        account = self.resolve_account_config(account_name)
+        data = self.model_dump(mode="python")
+        data.update(
+            {
+                "imap_host": account.imap_host if account.imap_host is not None else data.get("imap_host"),
+                "imap_port": account.imap_port if account.imap_port is not None else data.get("imap_port"),
+                "imap_username": account.imap_username if account.imap_username is not None else data.get("imap_username"),
+                "imap_password": account.imap_password if account.imap_password is not None else data.get("imap_password"),
+                "imap_mailbox": account.imap_mailbox if account.imap_mailbox is not None else data.get("imap_mailbox"),
+                "mailbox_id": account.resolved_mailbox_id(),
+                "smtp_host": account.smtp_host if account.smtp_host is not None else data.get("smtp_host"),
+                "smtp_port": account.smtp_port if account.smtp_port is not None else data.get("smtp_port"),
+                "smtp_username": account.smtp_username if account.smtp_username is not None else data.get("smtp_username"),
+                "smtp_password": account.smtp_password if account.smtp_password is not None else data.get("smtp_password"),
+                "smtp_from_address": account.smtp_from_address if account.smtp_from_address is not None else data.get("smtp_from_address"),
+                "smtp_use_tls": account.smtp_use_tls if account.smtp_use_tls is not None else data.get("smtp_use_tls"),
+                "smtp_starttls": account.smtp_starttls if account.smtp_starttls is not None else data.get("smtp_starttls"),
+            }
+        )
+        return type(self).model_validate(data)
 
     def resolved_mailbox_id(self) -> str:
         if not self._is_missing_value(self.mailbox_id):
@@ -137,6 +226,24 @@ class Settings(BaseSettings):
             *self.missing_openrouter_config(),
             *self.missing_supabase_config(),
         ]
+
+    def _default_account_config(self) -> EmailAccountConfig:
+        return EmailAccountConfig(
+            account_name=self.resolved_mailbox_id(),
+            mailbox_id=self.resolved_mailbox_id(),
+            imap_host=self.imap_host,
+            imap_port=self.imap_port,
+            imap_username=self.imap_username,
+            imap_password=self.imap_password,
+            imap_mailbox=self.imap_mailbox,
+            smtp_host=self.smtp_host,
+            smtp_port=self.smtp_port,
+            smtp_username=self.smtp_username,
+            smtp_password=self.smtp_password,
+            smtp_from_address=self.smtp_from_address,
+            smtp_use_tls=self.smtp_use_tls,
+            smtp_starttls=self.smtp_starttls,
+        )
 
 
 @lru_cache(maxsize=1)

@@ -70,6 +70,10 @@ class SmtpAdapter:
             smtp_message["Cc"] = ", ".join(message.cc)
         if message.reply_to:
             smtp_message["Reply-To"] = message.reply_to
+        if message.in_reply_to:
+            smtp_message["In-Reply-To"] = message.in_reply_to
+        if message.references:
+            smtp_message["References"] = message.references
         smtp_message["Subject"] = message.subject
         smtp_message["Date"] = formatdate(localtime=False)
         smtp_message["Message-ID"] = make_msgid()

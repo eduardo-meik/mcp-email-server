@@ -1,6 +1,6 @@
 ---
 name: mcp-email-server-2
-description: "Use this skill when you need to interact with the MCP Email Server for email ingestion, runtime checks, unread email sync, IMAP-to-Supabase workflows, or MCP tool invocation. Keywords: email MCP, sync unread emails, Supabase email embeddings, IMAP inbox sync, get_system_status, sync_unread_emails."
+description: "Use this skill when you need to interact with the MCP Email Server for email ingestion, runtime checks, unread email sync, mailbox browsing, email search, email state changes, outbound sends, or general MCP email workflows. Keywords: email MCP, sync unread emails, list mailboxes, list emails metadata, get email content, search emails, mark email, move email, delete emails, send_email."
 ---
 
 # MCP Email Server Skill
@@ -9,11 +9,11 @@ description: "Use this skill when you need to interact with the MCP Email Server
 
 This server is a stateless MCP and FastAPI service for email operations.
 
-Primary workflow:
+Primary workflows:
 1. Fetch unread emails from IMAP.
 2. Generate embeddings through OpenRouter.
 3. Persist messages and sync state in Supabase.
-4. Expose the workflow through MCP tools and HTTP endpoints.
+4. Expose mailbox browsing and email actions through MCP tools.
 
 ## Service Facts
 
@@ -46,6 +46,7 @@ Fetches unread emails, generates embeddings, persists them to Supabase, and upda
 
 Arguments:
 - `limit` integer, optional, default `25`.
+- `account_name` optional when multiple accounts are configured.
 
 Response shape:
 - `status`: `ok`, `blocked`, or `error`.
@@ -58,6 +59,131 @@ Response shape:
 - `missing_configuration`: required variables that are not configured.
 
 Use this tool when you need to trigger inbox ingestion from Claude.
+
+### `list_available_accounts`
+
+Returns the configured account surface for this deployment.
+
+Current behavior:
+- supports single-account and multi-account configurations.
+- `account_name` resolves the configured account entry and defaults to the first configured account.
+- `mailbox_id` is the persisted account partition for sync state and stored messages.
+
+### `get_current_datetime`
+
+Returns the current UTC timestamp.
+
+Use this before translating relative user requests like "hoy" or "esta semana" into concrete filters.
+
+### `list_mailboxes`
+
+Lists IMAP folders for the configured account.
+
+Arguments:
+- `account_name` optional, validated against the configured single account.
+
+### `list_emails_metadata`
+
+Lists email metadata from a mailbox with optional filtering.
+
+Arguments:
+- `account_name` optional.
+- `page` integer, default `1`.
+- `page_size` integer, default `10`.
+- `since` optional datetime.
+- `before` optional datetime.
+- `subject` optional partial subject filter.
+- `from_address` optional sender filter.
+- `to_address` optional recipient filter.
+- `order` `asc` or `desc`, default `desc`.
+- `mailbox` string, default `INBOX`.
+- `seen` optional boolean.
+- `flagged` optional boolean.
+- `answered` optional boolean.
+
+Response shape:
+- `emails`: list of metadata rows.
+- `total`: full match count before pagination.
+- `page`, `page_size`.
+
+### `get_emails_content`
+
+Fetches text and HTML bodies for specific `email_id` values.
+
+Arguments:
+- `email_ids` list of ids from `list_emails_metadata`.
+- `account_name` optional.
+- `mailbox` optional fallback mailbox, default `INBOX`.
+
+### `search_emails`
+
+Runs IMAP full-text `TEXT` search in the selected mailbox.
+
+Arguments:
+- `query` required string.
+- `account_name` optional.
+- `mailbox` string, default `INBOX`.
+- `page_size` integer, default `20`.
+
+### `mark_email`
+
+Marks messages using IMAP flags.
+
+Arguments:
+- `email_ids` list of ids.
+- `flag` one of `seen`, `flagged`, `answered`.
+- `enable` boolean, default `true`.
+- `account_name` optional.
+- `mailbox` string, default `INBOX`.
+
+### `move_email`
+
+Moves emails between folders.
+
+Arguments:
+- `email_ids` list of ids.
+- `destination_mailbox` required string.
+- `account_name` optional.
+- `source_mailbox` string, default `INBOX`.
+
+### `delete_emails`
+
+Deletes emails from the selected mailbox.
+
+Arguments:
+- `email_ids` list of ids.
+- `account_name` optional.
+- `mailbox` string, default `INBOX`.
+
+### `send_email`
+
+Sends outbound email through SMTP.
+
+Arguments:
+- `to` required list of recipients.
+- `subject` required string.
+- `body_text` required string.
+- `cc`, `bcc` optional recipient lists.
+- `body_html` optional HTML body.
+- `reply_to` optional reply-to header.
+- `in_reply_to` optional thread parent Message-ID.
+- `references` optional space-separated Message-ID chain.
+- `reply_email_id` optional email id; when provided, the server auto-fills `In-Reply-To`, `References`, and a `Re:` subject if needed.
+- `mailbox` optional mailbox used to resolve `reply_email_id`, default `INBOX`.
+- `account_name` optional when multiple accounts are configured.
+
+### `get_thread`
+
+Fetches a conversation thread anchored on a `Message-ID`.
+
+Arguments:
+- `message_id` required Message-ID.
+- `account_name` optional when multiple accounts are configured.
+- `mailbox` string, default `INBOX`.
+
+Response shape:
+- `message_id`: anchor Message-ID.
+- `emails`: list of full emails in thread order.
 
 ## Required Environment Variables
 
@@ -156,10 +282,14 @@ Example payload:
 ## Operational Guidance
 
 - Run `get_system_status` before `sync_unread_emails` if configuration may be incomplete.
+- Run `list_available_accounts` first if a user asks for an account name and you do not already know the configured one.
+- Run `get_current_datetime` before converting relative date requests into `since` or `before`.
+- Use `get_thread` or `reply_email_id` when replying, so the server carries forward `In-Reply-To` and `References` correctly.
 - Treat `status = blocked` as a configuration problem, not a transient runtime failure.
 - Treat `status = error` as an execution failure in IMAP, HTTP, OpenRouter, or Supabase.
 - The service stores the latest processed UID in Supabase and only fetches unseen messages after that point.
 - The server is designed to be stateless. Do not assume local file or SQLite persistence.
+- The current mailbox tooling is MVP scope: no attachment download and no dedicated credential store outside environment configuration.
 
 ## FastAPI Endpoints
 

@@ -26,11 +26,54 @@ SAMPLE_MESSAGE = (
     b"--abc--\r\n"
 )
 
+SAMPLE_MESSAGE_2 = (
+    b"Subject: Invoice reminder\r\n"
+    b"From: Billing <billing@example.com>\r\n"
+    b"To: Agent <agent@test.local>\r\n"
+    b"Message-ID: <message-2@example.com>\r\n"
+    b"Date: Sat, 12 Apr 2026 11:00:00 +0000\r\n"
+    b"Content-Type: multipart/mixed; boundary=def\r\n"
+    b"\r\n"
+    b"--def\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"Please review invoice 42\r\n"
+    b"--def\r\n"
+    b"Content-Type: application/pdf\r\n"
+    b"Content-Disposition: attachment; filename=invoice.pdf\r\n"
+    b"\r\n"
+    b"%PDF-1.4\r\n"
+    b"--def--\r\n"
+)
+
+SAMPLE_MESSAGE_3 = (
+    b"Subject: Re: [AUDTY-OP] Test subject\r\n"
+    b"From: Teammate <teammate@example.com>\r\n"
+    b"To: Sender <sender@example.com>\r\n"
+    b"Message-ID: <message-3@example.com>\r\n"
+    b"In-Reply-To: <message-1@example.com>\r\n"
+    b"References: <message-1@example.com>\r\n"
+    b"Date: Sat, 12 Apr 2026 12:00:00 +0000\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"Following up on the original note\r\n"
+)
+
 
 class FakeImapClient:
     def __init__(self) -> None:
         self.fetch_calls: list[tuple[str, str, str]] = []
+        self.search_calls: list[tuple[tuple[str, ...], str | None]] = []
+        self.store_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.move_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.copy_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.expunge_called = False
         self.logged_out = False
+        self.messages = {
+            "101": (SAMPLE_MESSAGE, [r"\Seen"]),
+            "102": (SAMPLE_MESSAGE_2, [r"\Seen", r"\Flagged", r"\Answered"]),
+            "103": (SAMPLE_MESSAGE_3, [r"\Seen"]),
+        }
 
     async def wait_hello_from_server(self):
         return None
@@ -44,21 +87,66 @@ class FakeImapClient:
         assert mailbox == "INBOX"
         return Response("OK", [b"1"])
 
-    async def search(self, *criteria, charset=None) -> Response:
-        assert criteria == ("UNSEEN",)
-        assert charset is None
-        return Response("OK", [b"101 102"])
-
-    async def uid(self, command: str, message_set: str, message_parts: str) -> Response:
-        self.fetch_calls.append((command, message_set, message_parts))
+    async def list(self) -> Response:
         return Response(
             "OK",
             [
-                f"{message_set} FETCH (UID {message_set} BODY[] {{{len(SAMPLE_MESSAGE)}}}".encode(),
-                SAMPLE_MESSAGE,
-                b")",
+                b'(\\HasNoChildren) "/" "INBOX"',
+                b'(\\HasNoChildren) "/" "Archive"',
             ],
         )
+
+    async def search(self, *criteria, charset=None) -> Response:
+        self.search_calls.append((criteria, charset))
+        assert charset is None
+        if criteria == ("UNSEEN",):
+            return Response("OK", [b"101 102"])
+        if "TEXT" in criteria:
+            return Response("OK", [b"102"])
+        if criteria == ("HEADER", "Message-ID", "<message-1@example.com>"):
+            return Response("OK", [b"101"])
+        if criteria == ("HEADER", "In-Reply-To", "<message-1@example.com>"):
+            return Response("OK", [b"103"])
+        if criteria == ("HEADER", "References", "<message-1@example.com>"):
+            return Response("OK", [b"103"])
+        if criteria == ("HEADER", "Message-ID", "<message-3@example.com>"):
+            return Response("OK", [b"103"])
+        if criteria == ("HEADER", "In-Reply-To", "<message-3@example.com>"):
+            return Response("OK", [b""])
+        if criteria == ("HEADER", "References", "<message-3@example.com>"):
+            return Response("OK", [b""])
+        if criteria == ("HEADER", "Subject", "Invoice"):
+            return Response("OK", [b"102"])
+        return Response("OK", [b"101 102"])
+
+    async def uid(self, command: str, *args: str) -> Response:
+        if command == "FETCH":
+            message_set, message_parts = args
+            self.fetch_calls.append((command, message_set, message_parts))
+            message_bytes, flags = self.messages[message_set]
+            flags_text = " ".join(flags)
+            return Response(
+                "OK",
+                [
+                    f"{message_set} FETCH (FLAGS ({flags_text}) UID {message_set} BODY[] {{{len(message_bytes)}}}".encode(),
+                    message_bytes,
+                    b")",
+                ],
+            )
+        if command == "STORE":
+            self.store_calls.append((command, args))
+            return Response("OK", [b"STORE completed"])
+        if command == "MOVE":
+            self.move_calls.append((command, args))
+            return Response("OK", [b"MOVE completed"])
+        if command == "COPY":
+            self.copy_calls.append((command, args))
+            return Response("OK", [b"COPY completed"])
+        raise AssertionError(f"Unexpected UID command: {command}")
+
+    async def expunge(self) -> Response:
+        self.expunge_called = True
+        return Response("OK", [b"EXPUNGE completed"])
 
     async def logout(self) -> Response:
         self.logged_out = True
@@ -132,6 +220,80 @@ async def test_fetch_unseen_filters_uids_using_last_uid() -> None:
 
     assert [message.uid for message in messages] == [102]
     assert client.fetch_calls == [("FETCH", "102", "BODY.PEEK[]")]
+
+
+@pytest.mark.asyncio
+async def test_list_mailboxes_returns_available_folders() -> None:
+    client = FakeImapClient()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    mailboxes = await adapter.list_mailboxes()
+
+    assert [mailbox.name for mailbox in mailboxes] == ["INBOX", "Archive"]
+
+
+@pytest.mark.asyncio
+async def test_list_emails_metadata_returns_paginated_results_with_flags() -> None:
+    client = FakeImapClient()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    emails, total = await adapter.list_emails_metadata(page=1, page_size=1, order="desc", subject="Invoice")
+
+    assert total == 1
+    assert len(emails) == 1
+    assert emails[0].uid == 102
+    assert emails[0].email_id == "INBOX:102"
+    assert emails[0].mailbox == "INBOX"
+    assert emails[0].from_address == "billing@example.com"
+    assert emails[0].seen is True
+    assert emails[0].flagged is True
+    assert emails[0].answered is True
+    assert emails[0].has_attachments is True
+    assert client.search_calls[-1][0] == ("HEADER", "Subject", "Invoice")
+
+
+@pytest.mark.asyncio
+async def test_get_emails_content_and_search_emails_return_expected_messages() -> None:
+    client = FakeImapClient()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    emails = await adapter.get_emails_content(["INBOX:102"])
+    search_results, total = await adapter.search_emails(query="invoice")
+
+    assert len(emails) == 1
+    assert emails[0].subject == "Invoice reminder"
+    assert "invoice 42" in emails[0].text_body
+    assert total == 1
+    assert [email.uid for email in search_results] == [102]
+    assert client.search_calls[-1][0] == ("TEXT", "invoice")
+
+
+@pytest.mark.asyncio
+async def test_get_thread_returns_related_messages_in_order() -> None:
+    client = FakeImapClient()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    thread = await adapter.get_thread(message_id="<message-1@example.com>")
+
+    assert [email.uid for email in thread] == [101, 103]
+    assert thread[0].message_id == "<message-1@example.com>"
+    assert thread[1].in_reply_to == "<message-1@example.com>"
+    assert thread[1].references == "<message-1@example.com>"
+
+
+@pytest.mark.asyncio
+async def test_mark_move_and_delete_issue_expected_imap_commands() -> None:
+    client = FakeImapClient()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    await adapter.mark_email(["INBOX:101"], flag="seen", enable=False)
+    await adapter.move_email(["INBOX:101"], destination_mailbox="Archive")
+    await adapter.delete_emails(["INBOX:102"])
+
+    assert client.store_calls[0] == ("STORE", ("101", "-FLAGS.SILENT", r"(\Seen)"))
+    assert client.move_calls[0] == ("MOVE", ("101", "Archive"))
+    assert client.store_calls[1] == ("STORE", ("102", "+FLAGS.SILENT", r"(\Deleted)"))
+    assert client.expunge_called is True
 
 
 @pytest.mark.asyncio

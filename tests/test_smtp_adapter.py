@@ -67,6 +67,8 @@ async def test_smtp_adapter_sends_email_with_expected_headers() -> None:
             text_body="Hello team",
             html_body="<p>Hello team</p>",
             reply_to="manager@example.com",
+            in_reply_to="<thread-parent@example.com>",
+            references="<thread-root@example.com> <thread-parent@example.com>",
         )
     )
 
@@ -81,6 +83,8 @@ async def test_smtp_adapter_sends_email_with_expected_headers() -> None:
     assert client.sent_message["To"] == "alice@example.com"
     assert client.sent_message["Cc"] == "bob@example.com"
     assert client.sent_message["Reply-To"] == "manager@example.com"
+    assert client.sent_message["In-Reply-To"] == "<thread-parent@example.com>"
+    assert client.sent_message["References"] == "<thread-root@example.com> <thread-parent@example.com>"
     assert client.sent_message["Subject"] == "Project update"
     assert "Hello team" in client.sent_message.as_string()
     assert "<p>Hello team</p>" in client.sent_message.as_string()

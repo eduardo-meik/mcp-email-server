@@ -1,3 +1,39 @@
-from mcp_email_server.schemas import EmailMessage, EmbeddedEmail, OutboundEmail, SendEmailResult, ServiceHealth, SyncRunResult
+from mcp_email_server.schemas import (
+	AvailableAccountsResult,
+	CurrentDatetimeResult,
+	EmailActionResult,
+	EmailAccount,
+	EmailContent,
+	EmailMessage,
+	EmailMetadata,
+	EmbeddedEmail,
+	GetEmailsContentResult,
+	GetThreadResult,
+	ListEmailsResult,
+	ListMailboxesResult,
+	MailboxInfo,
+	OutboundEmail,
+	SendEmailResult,
+	ServiceHealth,
+	SyncRunResult,
+)
 
-__all__ = ["EmailMessage", "EmbeddedEmail", "OutboundEmail", "SendEmailResult", "SyncRunResult", "ServiceHealth"]
+__all__ = [
+	"AvailableAccountsResult",
+	"CurrentDatetimeResult",
+	"EmailActionResult",
+	"EmailAccount",
+	"EmailContent",
+	"EmailMessage",
+	"EmailMetadata",
+	"EmbeddedEmail",
+	"GetEmailsContentResult",
+	"GetThreadResult",
+	"ListEmailsResult",
+	"ListMailboxesResult",
+	"MailboxInfo",
+	"OutboundEmail",
+	"SendEmailResult",
+	"SyncRunResult",
+	"ServiceHealth",
+]

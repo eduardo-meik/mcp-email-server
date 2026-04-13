@@ -222,6 +222,8 @@ class OutboundEmail(BaseModel):
     text_body: str
     html_body: str | None = None
     reply_to: str | None = None
+    in_reply_to: str | None = None
+    references: str | None = None
 
     @field_validator("to", "cc", "bcc", mode="before")
     @classmethod
@@ -236,7 +238,7 @@ class OutboundEmail(BaseModel):
             raise ValueError("value must not be blank")
         return cleaned
 
-    @field_validator("html_body", "reply_to", mode="before")
+    @field_validator("html_body", "reply_to", "in_reply_to", "references", mode="before")
     @classmethod
     def _normalize_optional_outbound_text(cls, value: str | None) -> str | None:
         cleaned = _strip_or_none(value)
@@ -272,3 +274,104 @@ class ServiceHealth(BaseModel):
     env: str
     status: Literal["ok", "degraded"]
     missing_configuration: list[str] = Field(default_factory=list)
+
+
+class ToolResult(BaseModel):
+    status: Literal["ok", "blocked", "error"]
+    details: str | None = None
+    missing_configuration: list[str] = Field(default_factory=list)
+
+
+class EmailAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_name: str
+    email_address: str
+    mailbox_id: str
+    default_mailbox: str = "INBOX"
+
+
+class AvailableAccountsResult(ToolResult):
+    accounts: list[EmailAccount] = Field(default_factory=list)
+
+
+class CurrentDatetimeResult(ToolResult):
+    current_datetime: datetime
+    timezone: str = "UTC"
+
+
+class MailboxInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+
+class ListMailboxesResult(ToolResult):
+    mailboxes: list[MailboxInfo] = Field(default_factory=list)
+
+
+class EmailMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email_id: str
+    account_name: str = ""
+    uid: int
+    mailbox: str = "INBOX"
+    message_id: str | None = None
+    in_reply_to: str | None = None
+    references: str | None = None
+    subject: str = ""
+    project_tag: str | None = None
+    from_address: str = ""
+    to_addresses: list[str] = Field(default_factory=list)
+    received_at: datetime | None = None
+    seen: bool = False
+    flagged: bool = False
+    answered: bool = False
+    has_attachments: bool = False
+
+
+class EmailContent(EmailMetadata):
+    text_body: str = ""
+    html_body: str | None = None
+
+    def as_metadata(self) -> EmailMetadata:
+        return EmailMetadata(
+            email_id=self.email_id,
+            account_name=self.account_name,
+            uid=self.uid,
+            mailbox=self.mailbox,
+            message_id=self.message_id,
+            in_reply_to=self.in_reply_to,
+            references=self.references,
+            subject=self.subject,
+            project_tag=self.project_tag,
+            from_address=self.from_address,
+            to_addresses=self.to_addresses,
+            received_at=self.received_at,
+            seen=self.seen,
+            flagged=self.flagged,
+            answered=self.answered,
+            has_attachments=self.has_attachments,
+        )
+
+
+class ListEmailsResult(ToolResult):
+    emails: list[EmailMetadata] = Field(default_factory=list)
+    page: int = 1
+    page_size: int = 10
+    total: int = 0
+
+
+class GetEmailsContentResult(ToolResult):
+    emails: list[EmailContent] = Field(default_factory=list)
+
+
+class GetThreadResult(ToolResult):
+    message_id: str
+    emails: list[EmailContent] = Field(default_factory=list)
+
+
+class EmailActionResult(ToolResult):
+    email_ids: list[str] = Field(default_factory=list)
+    count: int = 0
