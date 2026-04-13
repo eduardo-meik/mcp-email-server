@@ -3,8 +3,9 @@ import httpx
 from mcp_email_server.adapters.errors import AdapterConfigurationError, AdapterExecutionError
 from mcp_email_server.adapters.imap import ImapAdapter
 from mcp_email_server.adapters.openrouter import OpenRouterAdapter
+from mcp_email_server.adapters.smtp import SmtpAdapter
 from mcp_email_server.adapters.supabase import SupabaseAdapter
-from mcp_email_server.models import SyncRunResult
+from mcp_email_server.models import OutboundEmail, SendEmailResult, SyncRunResult
 
 
 class EmailSyncService:
@@ -12,11 +13,33 @@ class EmailSyncService:
         self,
         imap_adapter: ImapAdapter,
         openrouter_adapter: OpenRouterAdapter,
+        smtp_adapter: SmtpAdapter,
         supabase_adapter: SupabaseAdapter,
     ) -> None:
         self._imap_adapter = imap_adapter
         self._openrouter_adapter = openrouter_adapter
+        self._smtp_adapter = smtp_adapter
         self._supabase_adapter = supabase_adapter
+
+    async def send_email(self, message: OutboundEmail) -> SendEmailResult:
+        try:
+            message_id = await self._smtp_adapter.send_email(message)
+        except AdapterConfigurationError as exc:
+            return SendEmailResult(
+                status="blocked",
+                sent=False,
+                details=str(exc),
+                missing_configuration=exc.missing_configuration,
+            )
+        except AdapterExecutionError as exc:
+            return SendEmailResult(status="error", sent=False, details=str(exc))
+
+        return SendEmailResult(
+            status="ok",
+            sent=True,
+            message_id=message_id,
+            accepted_recipients=message.all_recipients,
+        )
 
     async def sync_unread_emails(self, limit: int) -> SyncRunResult:
         try:

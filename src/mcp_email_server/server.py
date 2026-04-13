@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from fastmcp import FastMCP
 
-from mcp_email_server.adapters import ImapAdapter, OpenRouterAdapter, SupabaseAdapter
+from mcp_email_server.adapters import ImapAdapter, OpenRouterAdapter, SmtpAdapter, SupabaseAdapter
 from mcp_email_server.config import Settings, get_settings
-from mcp_email_server.models import ServiceHealth, SyncRunResult
+from mcp_email_server.models import OutboundEmail, SendEmailResult, ServiceHealth, SyncRunResult
 from mcp_email_server.services import EmailSyncService
 
 
@@ -12,6 +12,7 @@ def build_service(settings: Settings | None = None) -> EmailSyncService:
     return EmailSyncService(
         imap_adapter=ImapAdapter(runtime_settings),
         openrouter_adapter=OpenRouterAdapter(runtime_settings),
+        smtp_adapter=SmtpAdapter(runtime_settings),
         supabase_adapter=SupabaseAdapter(runtime_settings),
     )
 
@@ -37,6 +38,28 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
     @server.tool(name="sync_unread_emails", description="Fetch unread emails, embed them, and persist them to Supabase.")
     async def sync_unread_emails(limit: int = 25) -> SyncRunResult:
         return await service.sync_unread_emails(limit=limit)
+
+    @server.tool(name="send_email", description="Send an outbound email through the configured SMTP server.")
+    async def send_email(
+        to: list[str],
+        subject: str,
+        body_text: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        body_html: str | None = None,
+        reply_to: str | None = None,
+    ) -> SendEmailResult:
+        return await service.send_email(
+            OutboundEmail(
+                to=to,
+                cc=cc or [],
+                bcc=bcc or [],
+                subject=subject,
+                text_body=body_text,
+                html_body=body_html,
+                reply_to=reply_to,
+            )
+        )
 
     return server
 

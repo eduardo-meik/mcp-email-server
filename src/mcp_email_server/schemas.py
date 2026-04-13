@@ -53,6 +53,26 @@ def _sanitize_untrusted_content(value: str | None) -> str:
     return sanitized
 
 
+def _normalize_address_list(value: str | Sequence[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values: Sequence[str] = [value]
+    else:
+        values = value
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        normalized = _clean_text(item).lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+
+    return cleaned
+
+
 class EmailMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -110,19 +130,7 @@ class EmailMessage(BaseModel):
     @field_validator("recipients", mode="before")
     @classmethod
     def _normalize_recipients(cls, value: list[str] | None) -> list[str]:
-        if not value:
-            return []
-
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for item in value:
-            normalized = _clean_text(item).lower()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            cleaned.append(normalized)
-
-        return cleaned
+        return _normalize_address_list(value)
 
     @field_validator("received_at", mode="before")
     @classmethod
@@ -202,6 +210,50 @@ class EmbeddedEmail(BaseModel):
     @staticmethod
     def _vector_literal(values: Sequence[float]) -> str:
         return "[" + ",".join(str(value) for value in values) + "]"
+
+
+class OutboundEmail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    to: list[str] = Field(default_factory=list)
+    cc: list[str] = Field(default_factory=list)
+    bcc: list[str] = Field(default_factory=list)
+    subject: str
+    text_body: str
+    html_body: str | None = None
+    reply_to: str | None = None
+
+    @field_validator("to", "cc", "bcc", mode="before")
+    @classmethod
+    def _normalize_address_fields(cls, value: str | Sequence[str] | None) -> list[str]:
+        return _normalize_address_list(value)
+
+    @field_validator("subject", "text_body", mode="before")
+    @classmethod
+    def _normalize_outbound_text(cls, value: str | None) -> str:
+        cleaned = _clean_text(value)
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
+
+    @field_validator("html_body", "reply_to", mode="before")
+    @classmethod
+    def _normalize_optional_outbound_text(cls, value: str | None) -> str | None:
+        cleaned = _strip_or_none(value)
+        return cleaned.lower() if cleaned and "@" in cleaned and "<" not in cleaned else cleaned
+
+    @property
+    def all_recipients(self) -> list[str]:
+        return [*self.to, *self.cc, *self.bcc]
+
+
+class SendEmailResult(BaseModel):
+    status: Literal["ok", "blocked", "error"]
+    sent: bool = False
+    message_id: str | None = None
+    accepted_recipients: list[str] = Field(default_factory=list)
+    details: str | None = None
+    missing_configuration: list[str] = Field(default_factory=list)
 
 
 class SyncRunResult(BaseModel):

@@ -33,6 +33,14 @@ services:
         sync: false
       - key: MCP_EMAIL_MAILBOX_ID
         sync: false
+      - key: MCP_EMAIL_SMTP_HOST
+        sync: false
+      - key: MCP_EMAIL_SMTP_USERNAME
+        sync: false
+      - key: MCP_EMAIL_SMTP_PASSWORD
+        sync: false
+      - key: MCP_EMAIL_SMTP_FROM_ADDRESS
+        sync: false
       - key: MCP_EMAIL_OPENROUTER_API_KEY
         sync: false
       - key: MCP_EMAIL_SUPABASE_URL
