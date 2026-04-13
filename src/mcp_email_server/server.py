@@ -45,8 +45,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     runtime_settings = settings or get_settings()
     service = build_service(runtime_settings)
     mcp_server = build_mcp_server(runtime_settings)
+    mcp_http_app = mcp_server.http_app(path="/", stateless_http=True)
 
-    fastapi_app = FastAPI(title=runtime_settings.app_name)
+    fastapi_app = FastAPI(title=runtime_settings.app_name, lifespan=mcp_http_app.lifespan)
 
     @fastapi_app.get("/healthz", response_model=ServiceHealth)
     async def healthz() -> ServiceHealth:
@@ -62,7 +63,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def poll_unread_emails(limit: int | None = None) -> SyncRunResult:
         return await service.sync_unread_emails(limit=limit or runtime_settings.poll_batch_size)
 
-    fastapi_app.mount("/mcp", mcp_server.http_app(path="/", stateless_http=True))
+    fastapi_app.mount("/mcp", mcp_http_app)
     return fastapi_app
 
 
