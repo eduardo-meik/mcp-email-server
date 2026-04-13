@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: mcp-email-server
+    runtime: docker
+    plan: free
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: MCP_EMAIL_ENV
+        value: production
+      - key: MCP_EMAIL_LOG_LEVEL
+        value: INFO
+      - key: MCP_EMAIL_POLL_BATCH_SIZE
+        value: 25
+      - key: MCP_EMAIL_IMAP_MAILBOX
+        value: INBOX
+      - key: MCP_EMAIL_OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: MCP_EMAIL_OPENROUTER_EMBEDDING_MODEL
+        value: nvidia/llama-nemotron-embed-vl-1b-v2:free
+      - key: MCP_EMAIL_SUPABASE_SCHEMA
+        value: public
+      - key: MCP_EMAIL_SUPABASE_MESSAGES_TABLE
+        value: email_embeddings
+      - key: MCP_EMAIL_SUPABASE_SYNC_STATE_TABLE
+        value: email_ingest_state
+      - key: MCP_EMAIL_IMAP_HOST
+        sync: false
+      - key: MCP_EMAIL_IMAP_USERNAME
+        sync: false
+      - key: MCP_EMAIL_IMAP_PASSWORD
+        sync: false
+      - key: MCP_EMAIL_MAILBOX_ID
+        sync: false
+      - key: MCP_EMAIL_OPENROUTER_API_KEY
+        sync: false
+      - key: MCP_EMAIL_SUPABASE_URL
+        sync: false
+      - key: MCP_EMAIL_SUPABASE_SERVICE_ROLE_KEY
+        sync: false

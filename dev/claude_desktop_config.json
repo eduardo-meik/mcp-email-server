@@ -1,8 +1,0 @@
-{
-    "mcpServers": {
-        "email-dev": {
-            "command": "{{ PWD }}/.venv/bin/python {{ PWD }}/mcp_email_server/cli.py",
-            "args": ["stdio"]
-        }
-    }
-}
