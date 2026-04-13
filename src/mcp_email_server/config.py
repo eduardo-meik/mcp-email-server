@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     env: str = "development"
     log_level: str = "INFO"
     poll_batch_size: int = 25
+    poll_webhook_secret: SecretStr | None = None
     accounts_json: str | None = None
 
     imap_host: str | None = None

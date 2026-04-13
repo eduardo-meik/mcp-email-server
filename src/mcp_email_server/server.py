@@ -1,6 +1,7 @@
 from datetime import datetime
+from secrets import compare_digest
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, status
 from fastmcp import FastMCP
 
 from mcp_email_server.adapters import ImapAdapter, OpenRouterAdapter, SmtpAdapter, SupabaseAdapter
@@ -70,6 +71,18 @@ def build_service_health(settings: Settings, account_name: str | None = None) ->
         status="ok" if not missing else "degraded",
         missing_configuration=missing,
     )
+
+
+def verify_poll_webhook_secret(settings: Settings, provided_secret: str | None) -> None:
+    if settings._is_missing_secret(settings.poll_webhook_secret):
+        return
+
+    expected_secret = settings.poll_webhook_secret.get_secret_value()
+    if provided_secret is None or not compare_digest(provided_secret, expected_secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing webhook secret.",
+        )
 
 
 def build_mcp_server(settings: Settings | None = None) -> FastMCP:
@@ -288,7 +301,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return build_service_health(runtime_settings, account_name=account_name)
 
     @fastapi_app.post("/tasks/poll", response_model=SyncRunResult)
-    async def poll_unread_emails(limit: int | None = None, account_name: str | None = None) -> SyncRunResult:
+    async def poll_unread_emails(
+        limit: int | None = None,
+        account_name: str | None = None,
+        x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+    ) -> SyncRunResult:
+        verify_poll_webhook_secret(runtime_settings, x_webhook_secret)
         try:
             service = build_service(runtime_settings, account_name=account_name)
         except ValueError as exc:
