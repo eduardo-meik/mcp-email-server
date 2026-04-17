@@ -85,6 +85,63 @@ def verify_poll_webhook_secret(settings: Settings, provided_secret: str | None) 
         )
 
 
+async def sync_configured_accounts(
+    settings: Settings,
+    limit: int,
+    account_name: str | None = None,
+) -> SyncRunResult:
+    try:
+        account_names = [account_name] if account_name else [account.account_name for account in settings.account_configs()]
+    except ValueError as exc:
+        return SyncRunResult(status="error", details=str(exc), dry_run=True)
+
+    results: list[tuple[str, SyncRunResult]] = []
+    for current_account_name in account_names:
+        try:
+            service = build_service(settings, account_name=current_account_name)
+        except ValueError as exc:
+            results.append(
+                (
+                    current_account_name or "default",
+                    SyncRunResult(status="error", details=str(exc), dry_run=True),
+                )
+            )
+            continue
+
+        results.append((current_account_name or "default", await service.sync_unread_emails(limit=limit)))
+
+    statuses = [result.status for _, result in results]
+    if any(current_status == "error" for current_status in statuses):
+        overall_status = "error"
+    elif any(current_status == "blocked" for current_status in statuses):
+        overall_status = "blocked"
+    else:
+        overall_status = "ok"
+
+    missing_configuration = [
+        f"{current_account_name}:{item}"
+        for current_account_name, result in results
+        for item in result.missing_configuration
+    ]
+    details = "; ".join(
+        f"{current_account_name}: {result.details}"
+        for current_account_name, result in results
+        if result.details
+    ) or None
+    last_uids = [result.last_uid for _, result in results if result.last_uid is not None]
+
+    return SyncRunResult(
+        status=overall_status,
+        fetched=sum(result.fetched for _, result in results),
+        embedded=sum(result.embedded for _, result in results),
+        persisted=sum(result.persisted for _, result in results),
+        last_uid=max(last_uids) if last_uids else None,
+        dry_run=any(result.dry_run for _, result in results),
+        details=details,
+        missing_configuration=missing_configuration,
+    )
+
+
 def build_mcp_server(settings: Settings | None = None) -> FastMCP:
     runtime_settings = settings or get_settings()
     server = FastMCP(
@@ -101,11 +158,7 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
 
     @server.tool(name="sync_unread_emails", description="Fetch unread emails, embed them, and persist them to Supabase.")
     async def sync_unread_emails(limit: int = 25, account_name: str | None = None) -> SyncRunResult:
-        try:
-            service = resolve_service(account_name=account_name)
-        except ValueError as exc:
-            return SyncRunResult(status="error", details=str(exc), dry_run=True)
-        return await service.sync_unread_emails(limit=limit)
+        return await sync_configured_accounts(runtime_settings, limit=limit, account_name=account_name)
 
     @server.tool(name="send_email", description="Send an outbound email through the configured SMTP server.")
     async def send_email(
@@ -307,11 +360,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
     ) -> SyncRunResult:
         verify_poll_webhook_secret(runtime_settings, x_webhook_secret)
-        try:
-            service = build_service(runtime_settings, account_name=account_name)
-        except ValueError as exc:
-            return SyncRunResult(status="error", details=str(exc), dry_run=True)
-        return await service.sync_unread_emails(limit=limit or runtime_settings.poll_batch_size)
+        return await sync_configured_accounts(
+            runtime_settings,
+            limit=limit or runtime_settings.poll_batch_size,
+            account_name=account_name,
+        )
 
     fastapi_app.mount("/mcp", mcp_http_app)
     return fastapi_app

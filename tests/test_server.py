@@ -136,3 +136,44 @@ def test_tasks_poll_accepts_requests_with_valid_secret(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["last_uid"] == 9
+
+
+def test_tasks_poll_syncs_all_configured_accounts_when_account_name_is_omitted(monkeypatch) -> None:
+    calls: list[str | None] = []
+
+    class DummyService:
+        def __init__(self, current_account_name: str | None) -> None:
+            self.current_account_name = current_account_name
+
+        async def sync_unread_emails(self, limit: int) -> SyncRunResult:
+            _ = limit
+            calls.append(self.current_account_name)
+            if self.current_account_name == "sales":
+                return SyncRunResult(status="ok", fetched=1, embedded=1, persisted=1, last_uid=10)
+            return SyncRunResult(status="ok", fetched=2, embedded=2, persisted=2, last_uid=20)
+
+    def fake_build_service(_settings: Settings | None = None, account_name: str | None = None) -> DummyService:
+        return DummyService(account_name)
+
+    monkeypatch.setattr("mcp_email_server.server.build_service", fake_build_service)
+
+    settings = Settings(
+        _env_file=None,
+        poll_batch_size=5,
+        accounts_json='['
+        '{"account_name":"sales","mailbox_id":"sales-box","imap_username":"sales@example.com","imap_password":"sales-pass"},'
+        '{"account_name":"support","mailbox_id":"support-box","imap_username":"support@example.com","imap_password":"support-pass"}'
+        ']',
+    )
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        response = client.post("/tasks/poll")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["fetched"] == 3
+    assert response.json()["embedded"] == 3
+    assert response.json()["persisted"] == 3
+    assert response.json()["last_uid"] == 20
+    assert calls == ["sales", "support"]

@@ -64,16 +64,21 @@ class ImapAdapter:
             search_response = await client.search("UNSEEN", charset=None)
             self._ensure_ok(search_response.result, "search unseen", search_response.lines)
 
-            uids = self._parse_search_uids(search_response.lines)
-            if since_uid is not None:
-                uids = [uid for uid in uids if uid > since_uid]
+            message_numbers = self._parse_search_uids(search_response.lines)
 
             messages: list[EmailMessage] = []
-            for uid in uids[:limit]:
-                fetch_response = await client.uid("FETCH", str(uid), "BODY.PEEK[]")
-                self._ensure_ok(fetch_response.result, f"fetch uid {uid}", fetch_response.lines)
+            for message_number in message_numbers:
+                fetch_response = await client.fetch(str(message_number), "(UID BODY.PEEK[])")
+                self._ensure_ok(fetch_response.result, f"fetch message {message_number}", fetch_response.lines)
                 message_bytes = self._extract_message_bytes(fetch_response.lines)
-                messages.append(self._parse_message(uid=uid, message_bytes=message_bytes))
+                resolved_uid = self._extract_uid(fetch_response.lines)
+                if resolved_uid is None:
+                    raise ValueError("FETCH response did not contain a UID")
+                if since_uid is not None and resolved_uid <= since_uid:
+                    continue
+                messages.append(self._parse_message(uid=resolved_uid, message_bytes=message_bytes))
+                if len(messages) >= limit:
+                    break
 
             return messages
         except (aioimaplib.AioImapException, asyncio.TimeoutError, ValueError) as exc:
@@ -116,7 +121,7 @@ class ImapAdapter:
 
         try:
             await self._login_and_select(client, selected_mailbox)
-            uids = await self._search_uids(
+            message_numbers = await self._search_uids(
                 client,
                 since=since,
                 before=before,
@@ -127,12 +132,12 @@ class ImapAdapter:
                 flagged=flagged,
                 answered=answered,
             )
-            ordered_uids = sorted(uids, reverse=order.lower() != "asc")
-            total = len(ordered_uids)
-            page_slice = self._paginate_uids(ordered_uids, page=page, page_size=page_size)
+            ordered_message_numbers = sorted(message_numbers, reverse=order.lower() != "asc")
+            total = len(ordered_message_numbers)
+            page_slice = self._paginate_uids(ordered_message_numbers, page=page, page_size=page_size)
             emails = [
-                (await self._fetch_email_content(client, uid=uid, mailbox=selected_mailbox)).as_metadata()
-                for uid in page_slice
+                (await self._fetch_email_content(client, message_number=message_number, mailbox=selected_mailbox)).as_metadata()
+                for message_number in page_slice
             ]
             return emails, total
         except (aioimaplib.AioImapException, asyncio.TimeoutError, ValueError) as exc:
@@ -153,7 +158,7 @@ class ImapAdapter:
             for selected_mailbox, uids in grouped.items():
                 await self._select_mailbox(client, selected_mailbox)
                 for uid in uids:
-                    emails.append(await self._fetch_email_content(client, uid=uid, mailbox=selected_mailbox))
+                    emails.append(await self._fetch_email_content_by_uid(client, uid=uid, mailbox=selected_mailbox))
             return emails
         except (aioimaplib.AioImapException, asyncio.TimeoutError, ValueError) as exc:
             raise AdapterExecutionError(f"IMAP get email content failed: {exc}") from exc
@@ -166,14 +171,14 @@ class ImapAdapter:
 
         try:
             await self._login_and_select(client, selected_mailbox)
-            uids = await self._search_uids(client, text_query=query)
-            ordered_uids = sorted(uids, reverse=True)
-            page_slice = ordered_uids[:page_size]
+            message_numbers = await self._search_uids(client, text_query=query)
+            ordered_message_numbers = sorted(message_numbers, reverse=True)
+            page_slice = ordered_message_numbers[:page_size]
             emails = [
-                (await self._fetch_email_content(client, uid=uid, mailbox=selected_mailbox)).as_metadata()
-                for uid in page_slice
+                (await self._fetch_email_content(client, message_number=message_number, mailbox=selected_mailbox)).as_metadata()
+                for message_number in page_slice
             ]
-            return emails, len(ordered_uids)
+            return emails, len(ordered_message_numbers)
         except (aioimaplib.AioImapException, asyncio.TimeoutError, ValueError) as exc:
             raise AdapterExecutionError(f"IMAP search failed: {exc}") from exc
         finally:
@@ -195,15 +200,15 @@ class ImapAdapter:
                     continue
                 visited_message_ids.add(current_message_id)
 
-                related_uids: set[int] = set()
+                related_message_numbers: set[int] = set()
                 for header_name in ("Message-ID", "In-Reply-To", "References"):
-                    related_uids.update(await self._search_header_uids(client, header_name, current_message_id))
+                    related_message_numbers.update(await self._search_header_uids(client, header_name, current_message_id))
 
-                for uid in sorted(related_uids):
-                    if uid in thread_messages:
+                for message_number in sorted(related_message_numbers):
+                    if message_number in thread_messages:
                         continue
-                    email = await self._fetch_email_content(client, uid=uid, mailbox=selected_mailbox)
-                    thread_messages[uid] = email
+                    email = await self._fetch_email_content(client, message_number=message_number, mailbox=selected_mailbox)
+                    thread_messages[message_number] = email
                     for related_message_id in self._extract_related_message_ids(email):
                         if related_message_id not in visited_message_ids:
                             pending_message_ids.append(related_message_id)
@@ -380,7 +385,17 @@ class ImapAdapter:
         self._ensure_ok(search_response.result, f"search header {header_name}", search_response.lines)
         return self._parse_search_uids(search_response.lines)
 
-    async def _fetch_email_content(self, client, uid: int, mailbox: str) -> EmailContent:
+    async def _fetch_email_content(self, client, message_number: int, mailbox: str) -> EmailContent:
+        fetch_response = await client.fetch(str(message_number), "(UID FLAGS BODY.PEEK[])")
+        self._ensure_ok(fetch_response.result, f"fetch message {message_number}", fetch_response.lines)
+        message_bytes = self._extract_message_bytes(fetch_response.lines)
+        resolved_uid = self._extract_uid(fetch_response.lines)
+        if resolved_uid is None:
+            raise ValueError("FETCH response did not contain a UID")
+        flags = self._extract_flags(fetch_response.lines)
+        return self._parse_email_content(uid=resolved_uid, mailbox=mailbox, message_bytes=message_bytes, flags=flags)
+
+    async def _fetch_email_content_by_uid(self, client, uid: int, mailbox: str) -> EmailContent:
         fetch_response = await client.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[])")
         self._ensure_ok(fetch_response.result, f"fetch uid {uid}", fetch_response.lines)
         message_bytes = self._extract_message_bytes(fetch_response.lines)

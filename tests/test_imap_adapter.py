@@ -119,10 +119,23 @@ class FakeImapClient:
             return Response("OK", [b"102"])
         return Response("OK", [b"101 102"])
 
+    async def fetch(self, message_set: str, message_parts: str) -> Response:
+        self.fetch_calls.append(("FETCH", message_set, message_parts))
+        message_bytes, flags = self.messages[message_set]
+        flags_text = " ".join(flags)
+        return Response(
+            "OK",
+            [
+                f"{message_set} FETCH (FLAGS ({flags_text}) UID {message_set} BODY[] {{{len(message_bytes)}}}".encode(),
+                message_bytes,
+                b")",
+            ],
+        )
+
     async def uid(self, command: str, *args: str) -> Response:
         if command == "FETCH":
             message_set, message_parts = args
-            self.fetch_calls.append((command, message_set, message_parts))
+            self.fetch_calls.append(("UID FETCH", message_set, message_parts))
             message_bytes, flags = self.messages[message_set]
             flags_text = " ".join(flags)
             return Response(
@@ -154,8 +167,8 @@ class FakeImapClient:
 
 
 class FakeImapClientCombinedFetch(FakeImapClient):
-    async def uid(self, command: str, message_set: str, message_parts: str) -> Response:
-        self.fetch_calls.append((command, message_set, message_parts))
+    async def fetch(self, message_set: str, message_parts: str) -> Response:
+        self.fetch_calls.append(("FETCH", message_set, message_parts))
         return Response(
             "OK",
             [
@@ -167,13 +180,53 @@ class FakeImapClientCombinedFetch(FakeImapClient):
 
 
 class FakeImapClientBytearrayBody(FakeImapClient):
-    async def uid(self, command: str, message_set: str, message_parts: str) -> Response:
-        self.fetch_calls.append((command, message_set, message_parts))
+    async def fetch(self, message_set: str, message_parts: str) -> Response:
+        self.fetch_calls.append(("FETCH", message_set, message_parts))
         return Response(
             "OK",
             [
                 f"{message_set} FETCH (UID {message_set} BODY[] {{{len(SAMPLE_MESSAGE)}}}".encode(),
                 bytearray(SAMPLE_MESSAGE),
+                b")",
+                b"Fetch completed (0.004 + 0.000 + 0.003 secs).",
+            ],
+        )
+
+
+class FakeImapClientSequenceSearch(FakeImapClient):
+    sequence_map = {
+        "1": "101",
+        "2": "102",
+        "3": "103",
+    }
+
+    async def search(self, *criteria, charset=None) -> Response:
+        self.search_calls.append((criteria, charset))
+        assert charset is None
+        if criteria == ("UNSEEN",):
+            return Response("OK", [b"1 2"])
+        if "TEXT" in criteria:
+            return Response("OK", [b"2"])
+        if criteria == ("HEADER", "Message-ID", "<message-1@example.com>"):
+            return Response("OK", [b"1"])
+        if criteria == ("HEADER", "In-Reply-To", "<message-1@example.com>"):
+            return Response("OK", [b"3"])
+        if criteria == ("HEADER", "References", "<message-1@example.com>"):
+            return Response("OK", [b"3"])
+        if criteria == ("HEADER", "Subject", "Invoice"):
+            return Response("OK", [b"2"])
+        return Response("OK", [b"1 2"])
+
+    async def fetch(self, message_set: str, message_parts: str) -> Response:
+        actual_uid = self.sequence_map[message_set]
+        self.fetch_calls.append(("FETCH", message_set, message_parts))
+        message_bytes, flags = self.messages[actual_uid]
+        flags_text = " ".join(flags)
+        return Response(
+            "OK",
+            [
+                f"{message_set} FETCH (FLAGS ({flags_text}) UID {actual_uid} BODY[] {{{len(message_bytes)}}}".encode(),
+                bytearray(message_bytes),
                 b")",
                 b"Fetch completed (0.004 + 0.000 + 0.003 secs).",
             ],
@@ -207,7 +260,7 @@ async def test_fetch_unseen_returns_parsed_messages() -> None:
     assert messages[0].recipients == ["alice@example.com", "bob@example.com", "carol@example.com"]
     assert messages[0].text_body.strip() == "Hello world"
     assert messages[0].html_body.strip() == "<p>Hello world</p>"
-    assert client.fetch_calls == [("FETCH", "101", "BODY.PEEK[]")]
+    assert client.fetch_calls == [("FETCH", "101", "(UID BODY.PEEK[])")]
     assert client.logged_out is True
 
 
@@ -219,7 +272,10 @@ async def test_fetch_unseen_filters_uids_using_last_uid() -> None:
     messages = await adapter.fetch_unseen(limit=10, since_uid=101)
 
     assert [message.uid for message in messages] == [102]
-    assert client.fetch_calls == [("FETCH", "102", "BODY.PEEK[]")]
+    assert client.fetch_calls == [
+        ("FETCH", "101", "(UID BODY.PEEK[])"),
+        ("FETCH", "102", "(UID BODY.PEEK[])"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -321,6 +377,34 @@ async def test_fetch_unseen_handles_message_body_as_bytearray() -> None:
     assert messages[0].subject == "[AUDTY-OP] Test subject"
     assert messages[0].sender == "sender@example.com"
     assert messages[0].text_body.strip() == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_fetch_unseen_uses_uid_from_fetch_when_search_returns_sequence_numbers() -> None:
+    client = FakeImapClientSequenceSearch()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    messages = await adapter.fetch_unseen(limit=10, since_uid=101)
+
+    assert [message.uid for message in messages] == [102]
+    assert client.fetch_calls == [
+        ("FETCH", "1", "(UID BODY.PEEK[])"),
+        ("FETCH", "2", "(UID BODY.PEEK[])"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_emails_metadata_handles_sequence_number_search_results() -> None:
+    client = FakeImapClientSequenceSearch()
+    adapter = ImapAdapter(build_settings(), client_factory=lambda **_: client)
+
+    emails, total = await adapter.list_emails_metadata(page=1, page_size=1, order="desc", subject="Invoice")
+
+    assert total == 1
+    assert len(emails) == 1
+    assert emails[0].uid == 102
+    assert emails[0].email_id == "INBOX:102"
+    assert client.fetch_calls == [("FETCH", "2", "(UID FLAGS BODY.PEEK[])")]
 
 
 def test_extract_project_tag_only_from_leading_brackets() -> None:

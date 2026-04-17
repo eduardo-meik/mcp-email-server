@@ -1,0 +1,39 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/mcp-email-server/mcp-email-server:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-central1-docker.pkg.dev/$PROJECT_ID/mcp-email-server/mcp-email-server:latest
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/mcp-email-server/mcp-email-server:latest
+      - --region=${_REGION}
+      - --platform=managed
+      - --port=8000
+      - --memory=1Gi
+      - --cpu=1
+      - --concurrency=10
+      - --timeout=300
+      - --max-instances=1
+      - --min-instances=0
+      - --set-env-vars=MCP_EMAIL_ENV=production,MCP_EMAIL_LOG_LEVEL=INFO,MCP_EMAIL_POLL_BATCH_SIZE=25,MCP_EMAIL_IMAP_MAILBOX=INBOX,MCP_EMAIL_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1,MCP_EMAIL_OPENROUTER_EMBEDDING_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2:free,MCP_EMAIL_SUPABASE_SCHEMA=public,MCP_EMAIL_SUPABASE_MESSAGES_TABLE=email_embeddings,MCP_EMAIL_SUPABASE_SYNC_STATE_TABLE=email_ingest_state
+      - --set-secrets=MCP_EMAIL_ACCOUNTS_JSON=mcp-email-accounts-json:latest,MCP_EMAIL_OPENROUTER_API_KEY=mcp-email-openrouter-api-key:latest,MCP_EMAIL_SUPABASE_URL=mcp-email-supabase-url:latest,MCP_EMAIL_SUPABASE_SERVICE_ROLE_KEY=mcp-email-supabase-service-role-key:latest,MCP_EMAIL_POLL_WEBHOOK_SECRET=mcp-email-poll-webhook-secret:latest
+      - --allow-unauthenticated
+
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/mcp-email-server/mcp-email-server:latest
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE: mcp-email-server
