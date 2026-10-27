@@ -5,7 +5,16 @@ from math import isfinite
 from typing import ClassVar
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from mcp_email_server.attachments import (
+    DEFAULT_CONTENT_TYPE,
+    MAX_ATTACHMENT_BYTES,
+    decode_base64,
+    guess_content_type,
+    normalize_base64,
+    text_payload_to_bytes,
+)
 
 
 PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -212,6 +221,97 @@ class EmbeddedEmail(BaseModel):
         return "[" + ",".join(str(value) for value in values) + "]"
 
 
+class OutboundAttachment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str = Field(description="File name shown to the recipient, including the extension when available.")
+    content_text: str | None = Field(
+        default=None,
+        description=(
+            "Document text authored directly by the model. Use this for reports, invoices, letters or any "
+            "generated document. When content_type is application/pdf the server renders the PDF."
+        ),
+    )
+    content_base64: str | None = Field(
+        default=None,
+        description=(
+            "Base64-encoded raw bytes, only for files whose bytes already exist. Prefer content_text for "
+            "generated documents. Data URLs are accepted."
+        ),
+    )
+    content_type: str | None = Field(
+        default=None,
+        description=(
+            "MIME type for the attachment, for example application/pdf or image/png. "
+            "When omitted it is inferred from the file extension."
+        ),
+    )
+    disposition: Literal["attachment", "inline"] = Field(
+        default="attachment",
+        description="Use 'attachment' for normal files or 'inline' for content referenced from the HTML body.",
+    )
+    content_id: str | None = Field(
+        default=None,
+        description="Optional content ID for inline attachments referenced from HTML, for example logo123.",
+    )
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def _normalize_required_attachment_text(cls, value: str | None) -> str:
+        cleaned = _clean_text(value)
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
+
+    @field_validator("content_type", mode="before")
+    @classmethod
+    def _normalize_optional_content_type(cls, value: str | None) -> str | None:
+        return _strip_or_none(value)
+
+    @field_validator("content_base64", mode="before")
+    @classmethod
+    def _normalize_base64_payload(cls, value: str | None) -> str | None:
+        cleaned = _strip_or_none(value)
+        if cleaned is None:
+            return None
+        return normalize_base64(cleaned)
+
+    @field_validator("content_text", mode="before")
+    @classmethod
+    def _normalize_content_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.replace("\x00", "")
+        return cleaned if cleaned.strip() else None
+
+    @field_validator("content_id", mode="before")
+    @classmethod
+    def _normalize_optional_attachment_text(cls, value: str | None) -> str | None:
+        return _strip_or_none(value)
+
+    @model_validator(mode="after")
+    def _require_single_content_source(self) -> "OutboundAttachment":
+        sources = [source for source in (self.content_base64, self.content_text) if source]
+        if len(sources) != 1:
+            raise ValueError("provide exactly one of content_text or content_base64")
+        return self
+
+    def resolved_content_type(self) -> str:
+        return self.content_type or guess_content_type(self.filename) or DEFAULT_CONTENT_TYPE
+
+    def as_bytes(self) -> bytes:
+        if self.content_base64:
+            payload = decode_base64(self.content_base64)
+        else:
+            payload = text_payload_to_bytes(self.content_text or "", self.resolved_content_type())
+
+        if len(payload) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"attachment '{self.filename}' exceeds the {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB limit"
+            )
+        return payload
+
+
 class OutboundEmail(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -221,6 +321,10 @@ class OutboundEmail(BaseModel):
     subject: str
     text_body: str
     html_body: str | None = None
+    attachments: list[OutboundAttachment] = Field(
+        default_factory=list,
+        description="Optional files to attach to the outbound email.",
+    )
     reply_to: str | None = None
     in_reply_to: str | None = None
     references: str | None = None
@@ -289,10 +393,20 @@ class EmailAccount(BaseModel):
     email_address: str
     mailbox_id: str
     default_mailbox: str = "INBOX"
+    persona_name: str | None = None
+
+
+class AccountProfile(EmailAccount):
+    persona_instructions: str | None = None
+    signature: str | None = None
 
 
 class AvailableAccountsResult(ToolResult):
     accounts: list[EmailAccount] = Field(default_factory=list)
+
+
+class GetAccountProfileResult(ToolResult):
+    profile: AccountProfile | None = None
 
 
 class CurrentDatetimeResult(ToolResult):
@@ -370,6 +484,25 @@ class GetEmailsContentResult(ToolResult):
 class GetThreadResult(ToolResult):
     message_id: str
     emails: list[EmailContent] = Field(default_factory=list)
+
+
+class StoredEmailContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str
+    folder: str = "INBOX"
+    message_id: str | None = None
+    subject: str = ""
+    from_address: str = ""
+    to_addresses: list[str] = Field(default_factory=list)
+    received_at: datetime | None = None
+    body_text: str = ""
+
+
+class GetStoredEmailContextResult(ToolResult):
+    anchor_email_id: str | None = None
+    normalized_subject: str = ""
+    emails: list[StoredEmailContext] = Field(default_factory=list)
 
 
 class EmailActionResult(ToolResult):

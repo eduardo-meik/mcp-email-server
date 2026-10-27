@@ -87,7 +87,9 @@ class FakeImapClient:
         assert mailbox == "INBOX"
         return Response("OK", [b"1"])
 
-    async def list(self) -> Response:
+    async def list(self, reference_name: str = '""', mailbox_pattern: str = "*") -> Response:
+        assert reference_name == '""'
+        assert mailbox_pattern == "*"
         return Response(
             "OK",
             [

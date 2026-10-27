@@ -92,7 +92,7 @@ class ImapAdapter:
 
         try:
             await self._login(client)
-            list_response = await client.list()
+            list_response = await client.list('""', "*")
             self._ensure_ok(list_response.result, "list mailboxes", list_response.lines)
             mailbox_names = self._parse_mailboxes(list_response.lines)
             return [MailboxInfo(name=name) for name in mailbox_names]

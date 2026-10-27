@@ -1,9 +1,12 @@
+import base64
+
 import pytest
+from pydantic import ValidationError
 
 from mcp_email_server.adapters.errors import AdapterConfigurationError
 from mcp_email_server.adapters.smtp import SmtpAdapter
 from mcp_email_server.config import Settings
-from mcp_email_server.models import OutboundEmail
+from mcp_email_server.models import OutboundAttachment, OutboundEmail
 
 
 class FakeSmtpClient:
@@ -78,7 +81,12 @@ async def test_smtp_adapter_sends_email_with_expected_headers() -> None:
     assert client.logged_in is True
     assert client.quit_called is True
     assert client.sent_sender == "mailer@test.local"
-    assert client.sent_recipients == ["alice@example.com", "bob@example.com", "carol@example.com"]
+    assert client.sent_recipients == [
+        "alice@example.com",
+        "bob@example.com",
+        "carol@example.com",
+        "4452112@bcc.hubspot.com",
+    ]
     assert client.sent_message["From"] == "mailer@test.local"
     assert client.sent_message["To"] == "alice@example.com"
     assert client.sent_message["Cc"] == "bob@example.com"
@@ -88,6 +96,103 @@ async def test_smtp_adapter_sends_email_with_expected_headers() -> None:
     assert client.sent_message["Subject"] == "Project update"
     assert "Hello team" in client.sent_message.as_string()
     assert "<p>Hello team</p>" in client.sent_message.as_string()
+
+
+def test_smtp_adapter_adds_required_hubspot_bcc_without_duplicates() -> None:
+    adapter = SmtpAdapter(build_settings())
+
+    enriched = adapter.with_required_bcc(
+        OutboundEmail(
+            to=["alice@example.com"],
+            bcc=["4452112@bcc.hubspot.com", "carol@example.com"],
+            subject="Project update",
+            text_body="Hello team",
+        )
+    )
+
+    assert enriched.bcc == ["4452112@bcc.hubspot.com", "carol@example.com"]
+
+
+@pytest.mark.asyncio
+async def test_smtp_adapter_adds_attachments_to_mime_message() -> None:
+    client = FakeSmtpClient(hostname="mail.test.local", port=587, use_tls=False)
+    adapter = SmtpAdapter(build_settings(), client_factory=lambda **kwargs: client)
+
+    await adapter.send_email(
+        OutboundEmail(
+            to=["alice@example.com"],
+            subject="Invoice attached",
+            text_body="Please see the invoice.",
+            attachments=[
+                OutboundAttachment(
+                    filename="invoice.pdf",
+                    content_type="application/pdf",
+                    content_base64=base64.b64encode(b"fake-pdf-bytes").decode("ascii"),
+                )
+            ],
+        )
+    )
+
+    attachments = list(client.sent_message.iter_attachments())
+
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "invoice.pdf"
+    assert attachments[0].get_content_type() == "application/pdf"
+    assert attachments[0].get_payload(decode=True) == b"fake-pdf-bytes"
+
+
+@pytest.mark.asyncio
+async def test_smtp_adapter_renders_pdf_attachment_from_authored_text() -> None:
+    client = FakeSmtpClient(hostname="mail.test.local", port=587, use_tls=False)
+    adapter = SmtpAdapter(build_settings(), client_factory=lambda **kwargs: client)
+
+    await adapter.send_email(
+        OutboundEmail(
+            to=["alice@example.com"],
+            subject="Cotizacion adjunta",
+            text_body="Adjunto la cotizacion solicitada.",
+            attachments=[
+                OutboundAttachment(
+                    filename="cotizacion.pdf",
+                    content_type="application/pdf",
+                    content_text="# Cotizacion\n\nTotal: 1.250 USD\nVigencia: 15 dias.",
+                )
+            ],
+        )
+    )
+
+    attachments = list(client.sent_message.iter_attachments())
+
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "cotizacion.pdf"
+    assert attachments[0].get_content_type() == "application/pdf"
+    assert attachments[0].get_payload(decode=True).startswith(b"%PDF-")
+
+
+def test_outbound_attachment_infers_content_type_and_accepts_data_urls() -> None:
+    text_attachment = OutboundAttachment(filename="notas.txt", content_text="hola")
+    data_url_attachment = OutboundAttachment(
+        filename="logo.png",
+        content_base64="data:image/png;base64,aGVsbG8=",
+    )
+
+    assert text_attachment.resolved_content_type() == "text/plain"
+    assert text_attachment.as_bytes() == b"hola"
+    assert data_url_attachment.content_base64 == "aGVsbG8="
+    assert data_url_attachment.resolved_content_type() == "image/png"
+    assert data_url_attachment.as_bytes() == b"hello"
+
+
+def test_outbound_attachment_requires_exactly_one_content_source() -> None:
+    with pytest.raises(ValidationError):
+        OutboundAttachment(filename="empty.pdf")
+
+    with pytest.raises(ValidationError):
+        OutboundAttachment(
+            filename="both.pdf",
+            content_text="texto",
+            content_base64=base64.b64encode(b"bytes").decode("ascii"),
+        )
 
 
 @pytest.mark.asyncio

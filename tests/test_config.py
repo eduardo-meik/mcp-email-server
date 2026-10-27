@@ -50,3 +50,39 @@ def test_settings_resolves_accounts_from_accounts_json() -> None:
     assert support.resolved_mailbox_id() == "support-box"
     assert support.imap_mailbox == "Support"
     assert support_by_email.smtp_from_address == "support@example.com"
+
+
+def test_settings_propagate_persona_fields_per_account() -> None:
+    settings = Settings(
+        _env_file=None,
+        imap_host="mail.shared.local",
+        smtp_host="mail.shared.local",
+        accounts_json='['
+        '{"account_name":"sales","imap_username":"sales@example.com","imap_password":"sales-pass","persona_name":"Sales closer","persona_instructions":"Be concise and commercial.","signature":"Sales Team"},'
+        '{"account_name":"support","imap_username":"support@example.com","imap_password":"support-pass","persona_name":"Support advisor","persona_instructions":"Be calm and solution-oriented.","signature":"Support Desk"}'
+        ']',
+    )
+
+    support = settings.for_account("support")
+
+    assert support.persona_name == "Support advisor"
+    assert support.persona_instructions == "Be calm and solution-oriented."
+    assert support.signature == "Support Desk"
+
+
+def test_settings_expose_required_hubspot_bcc_by_default_and_per_account() -> None:
+    settings = Settings(
+        _env_file=None,
+        imap_host="mail.shared.local",
+        smtp_host="mail.shared.local",
+        accounts_json='['
+        '{"account_name":"sales","imap_username":"sales@example.com","imap_password":"sales-pass","smtp_username":"sales@example.com","smtp_password":"sales-pass","smtp_from_address":"sales@example.com"},'
+        '{"account_name":"support","imap_username":"support@example.com","imap_password":"support-pass","smtp_username":"support@example.com","smtp_password":"support-pass","smtp_from_address":"support@example.com","hubspot_bcc_address":"support-bcc@bcc.hubspot.com"}'
+        ']',
+    )
+
+    sales = settings.for_account("sales")
+    support = settings.for_account("support")
+
+    assert sales.required_bcc_recipients() == ["4452112@bcc.hubspot.com"]
+    assert support.required_bcc_recipients() == ["support-bcc@bcc.hubspot.com"]

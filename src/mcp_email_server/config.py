@@ -20,6 +20,9 @@ class EmailAccountConfig(BaseModel):
 
     account_name: str
     mailbox_id: str | None = None
+    persona_name: str | None = None
+    persona_instructions: str | None = None
+    signature: str | None = None
     imap_host: str | None = None
     imap_port: int | None = None
     imap_username: str | None = None
@@ -32,6 +35,7 @@ class EmailAccountConfig(BaseModel):
     smtp_from_address: str | None = None
     smtp_use_tls: bool | None = None
     smtp_starttls: bool | None = None
+    hubspot_bcc_address: str | None = None
 
     def resolved_mailbox_id(self) -> str:
         if self.mailbox_id and self.mailbox_id.strip():
@@ -59,6 +63,9 @@ class Settings(BaseSettings):
     poll_batch_size: int = 25
     poll_webhook_secret: SecretStr | None = None
     accounts_json: str | None = None
+    persona_name: str | None = None
+    persona_instructions: str | None = None
+    signature: str | None = None
 
     imap_host: str | None = None
     imap_port: int = 993
@@ -74,6 +81,7 @@ class Settings(BaseSettings):
     smtp_from_address: str | None = None
     smtp_use_tls: bool = False
     smtp_starttls: bool = True
+    hubspot_bcc_address: str | None = "4452112@bcc.hubspot.com"
 
     openrouter_api_key: SecretStr | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -160,6 +168,11 @@ class Settings(BaseSettings):
                 "imap_password": account.imap_password if account.imap_password is not None else data.get("imap_password"),
                 "imap_mailbox": account.imap_mailbox if account.imap_mailbox is not None else data.get("imap_mailbox"),
                 "mailbox_id": account.resolved_mailbox_id(),
+                "persona_name": account.persona_name if account.persona_name is not None else data.get("persona_name"),
+                "persona_instructions": account.persona_instructions
+                if account.persona_instructions is not None
+                else data.get("persona_instructions"),
+                "signature": account.signature if account.signature is not None else data.get("signature"),
                 "smtp_host": account.smtp_host if account.smtp_host is not None else data.get("smtp_host"),
                 "smtp_port": account.smtp_port if account.smtp_port is not None else data.get("smtp_port"),
                 "smtp_username": account.smtp_username if account.smtp_username is not None else data.get("smtp_username"),
@@ -167,6 +180,9 @@ class Settings(BaseSettings):
                 "smtp_from_address": account.smtp_from_address if account.smtp_from_address is not None else data.get("smtp_from_address"),
                 "smtp_use_tls": account.smtp_use_tls if account.smtp_use_tls is not None else data.get("smtp_use_tls"),
                 "smtp_starttls": account.smtp_starttls if account.smtp_starttls is not None else data.get("smtp_starttls"),
+                "hubspot_bcc_address": account.hubspot_bcc_address
+                if account.hubspot_bcc_address is not None
+                else data.get("hubspot_bcc_address"),
             }
         )
         return type(self).model_validate(data)
@@ -184,6 +200,11 @@ class Settings(BaseSettings):
         if not self._is_missing_value(self.smtp_username):
             return self.smtp_username.strip().lower()
         return None
+
+    def required_bcc_recipients(self) -> list[str]:
+        if self._is_missing_value(self.hubspot_bcc_address):
+            return []
+        return [self.hubspot_bcc_address.strip().lower()]
 
     def resolved_supabase_rest_url(self) -> str | None:
         if self._is_missing_value(self.supabase_url):
@@ -228,10 +249,18 @@ class Settings(BaseSettings):
             *self.missing_supabase_config(),
         ]
 
+    def resolved_poll_webhook_secret(self) -> str | None:
+        if self._is_missing_secret(self.poll_webhook_secret):
+            return None
+        return self.poll_webhook_secret.get_secret_value()
+
     def _default_account_config(self) -> EmailAccountConfig:
         return EmailAccountConfig(
             account_name=self.resolved_mailbox_id(),
             mailbox_id=self.resolved_mailbox_id(),
+            persona_name=self.persona_name,
+            persona_instructions=self.persona_instructions,
+            signature=self.signature,
             imap_host=self.imap_host,
             imap_port=self.imap_port,
             imap_username=self.imap_username,

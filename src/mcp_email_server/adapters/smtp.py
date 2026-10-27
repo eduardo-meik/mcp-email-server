@@ -28,13 +28,13 @@ class SmtpAdapter:
         if sender is None:
             raise AdapterConfigurationError(["MCP_EMAIL_SMTP_FROM_ADDRESS"])
 
+        message = self.with_required_bcc(message)
         smtp_message = self._build_message(sender=sender, message=message)
         client = self._client_factory(
             hostname=self._settings.smtp_host,
             port=self._settings.smtp_port,
             use_tls=self._settings.smtp_use_tls,
         )
-
         try:
             await client.connect()
             if not self._settings.smtp_use_tls and self._settings.smtp_starttls:
@@ -61,6 +61,17 @@ class SmtpAdapter:
             raise AdapterExecutionError("SMTP server accepted the email without returning a Message-ID")
         return message_id
 
+    def with_required_bcc(self, message: OutboundEmail) -> OutboundEmail:
+        required_bcc = self._settings.required_bcc_recipients()
+        if not required_bcc:
+            return message
+
+        merged_bcc = list(dict.fromkeys([*message.bcc, *required_bcc]))
+        if merged_bcc == message.bcc:
+            return message
+
+        return message.model_copy(update={"bcc": merged_bcc})
+
     @staticmethod
     def _build_message(sender: str, message: OutboundEmail) -> SmtpMessage:
         smtp_message = SmtpMessage()
@@ -80,4 +91,21 @@ class SmtpAdapter:
         smtp_message.set_content(message.text_body)
         if message.html_body:
             smtp_message.add_alternative(message.html_body, subtype="html")
+        for attachment in message.attachments:
+            resolved_type = attachment.resolved_content_type()
+            maintype, separator, subtype = resolved_type.partition("/")
+            if not separator or not maintype or not subtype:
+                maintype, subtype = "application", "octet-stream"
+            try:
+                payload = attachment.as_bytes()
+            except ValueError as exc:
+                raise AdapterExecutionError(f"Invalid attachment '{attachment.filename}': {exc}") from exc
+            smtp_message.add_attachment(
+                payload,
+                maintype=maintype,
+                subtype=subtype,
+                filename=attachment.filename,
+                disposition=attachment.disposition,
+                cid=attachment.content_id,
+            )
         return smtp_message

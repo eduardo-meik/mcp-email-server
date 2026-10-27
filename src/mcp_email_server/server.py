@@ -1,20 +1,26 @@
 from datetime import datetime
 from secrets import compare_digest
+from typing import Annotated
 
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastmcp import FastMCP
+from pydantic import Field
 
 from mcp_email_server.adapters import ImapAdapter, OpenRouterAdapter, SmtpAdapter, SupabaseAdapter
 from mcp_email_server.config import Settings, get_settings
 from mcp_email_server.models import (
+    AccountProfile,
     AvailableAccountsResult,
     CurrentDatetimeResult,
     EmailAccount,
     EmailActionResult,
+    GetAccountProfileResult,
     GetEmailsContentResult,
+    GetStoredEmailContextResult,
     GetThreadResult,
     ListEmailsResult,
     ListMailboxesResult,
+    OutboundAttachment,
     OutboundEmail,
     SendEmailResult,
     ServiceHealth,
@@ -42,9 +48,32 @@ def configured_accounts(settings: Settings) -> list[EmailAccount]:
                 email_address=account.resolved_email_address(),
                 mailbox_id=account.resolved_mailbox_id(),
                 default_mailbox=account.imap_mailbox or settings.imap_mailbox,
+                persona_name=account.persona_name,
             )
         )
     return accounts
+
+
+def build_account_profile(settings: Settings, account_name: str | None = None) -> AccountProfile:
+    account = settings.resolve_account_config(account_name)
+    return AccountProfile(
+        account_name=account.account_name,
+        email_address=account.resolved_email_address(),
+        mailbox_id=account.resolved_mailbox_id(),
+        default_mailbox=account.imap_mailbox or settings.imap_mailbox,
+        persona_name=account.persona_name,
+        persona_instructions=account.persona_instructions,
+        signature=account.signature,
+    )
+
+
+def build_account_profile_result(settings: Settings, account_name: str | None = None) -> GetAccountProfileResult:
+    try:
+        profile = build_account_profile(settings, account_name=account_name)
+    except ValueError as exc:
+        return GetAccountProfileResult(status="error", details=str(exc))
+
+    return GetAccountProfileResult(status="ok", profile=profile)
 
 
 def build_service_health(settings: Settings, account_name: str | None = None) -> ServiceHealth:
@@ -74,10 +103,10 @@ def build_service_health(settings: Settings, account_name: str | None = None) ->
 
 
 def verify_poll_webhook_secret(settings: Settings, provided_secret: str | None) -> None:
-    if settings._is_missing_secret(settings.poll_webhook_secret):
+    expected_secret = settings.resolved_poll_webhook_secret()
+    if expected_secret is None:
         return
 
-    expected_secret = settings.poll_webhook_secret.get_secret_value()
     if provided_secret is None or not compare_digest(provided_secret, expected_secret):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -160,20 +189,53 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
     async def sync_unread_emails(limit: int = 25, account_name: str | None = None) -> SyncRunResult:
         return await sync_configured_accounts(runtime_settings, limit=limit, account_name=account_name)
 
-    @server.tool(name="send_email", description="Send an outbound email through the configured SMTP server.")
+    @server.tool(
+        name="send_email",
+        description=(
+            "Send an outbound email through the configured SMTP server. "
+            "Supports file attachments through attachments[]: pass content_text to have the server "
+            "build the file, including PDF rendering."
+        ),
+    )
     async def send_email(
-        to: list[str],
-        subject: str,
-        body_text: str,
-        cc: list[str] | None = None,
-        bcc: list[str] | None = None,
-        body_html: str | None = None,
-        reply_to: str | None = None,
-        in_reply_to: str | None = None,
-        references: str | None = None,
-        reply_email_id: str | None = None,
-        mailbox: str = "INBOX",
-        account_name: str | None = None,
+        to: Annotated[list[str], Field(description="Primary recipient email addresses.")],
+        subject: Annotated[str, Field(description="Email subject line.")],
+        body_text: Annotated[str, Field(description="Plain-text body of the email.")],
+        cc: Annotated[list[str] | None, Field(description="Optional CC recipient email addresses.")] = None,
+        bcc: Annotated[list[str] | None, Field(description="Optional BCC recipient email addresses.")] = None,
+        body_html: Annotated[
+            str | None,
+            Field(description="Optional HTML version of the email body."),
+        ] = None,
+        attachments: Annotated[
+            list[OutboundAttachment] | None,
+            Field(
+                description=(
+                    "Optional file attachments. For documents you author (reports, invoices, letters, quotes) "
+                    "pass content_text together with filename and content_type; when content_type is "
+                    "application/pdf the server renders the PDF for you. Use content_base64 only when you "
+                    "already hold the encoded bytes of an existing file."
+                )
+            ),
+        ] = None,
+        reply_to: Annotated[str | None, Field(description="Optional Reply-To email address.")] = None,
+        in_reply_to: Annotated[
+            str | None,
+            Field(description="Optional Message-ID this email replies to."),
+        ] = None,
+        references: Annotated[
+            str | None,
+            Field(description="Optional References header used to preserve thread context."),
+        ] = None,
+        reply_email_id: Annotated[
+            str | None,
+            Field(description="Optional internal email_id to anchor the reply against stored context."),
+        ] = None,
+        mailbox: Annotated[str, Field(description="Mailbox used to resolve reply context. Defaults to INBOX.")] = "INBOX",
+        account_name: Annotated[
+            str | None,
+            Field(description="Optional configured account name when multiple outbound accounts exist."),
+        ] = None,
     ) -> SendEmailResult:
         try:
             service = resolve_service(account_name=account_name)
@@ -187,6 +249,7 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
                 subject=subject,
                 text_body=body_text,
                 html_body=body_html,
+                attachments=attachments or [],
                 reply_to=reply_to,
                 in_reply_to=in_reply_to,
                 references=references,
@@ -198,6 +261,10 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
     @server.tool(name="list_available_accounts", description="List the configured email accounts available to the server.")
     async def list_available_accounts() -> AvailableAccountsResult:
         return AvailableAccountsResult(status="ok", accounts=configured_accounts(runtime_settings))
+
+    @server.tool(name="get_account_profile", description="Return the selected account persona, signature, and response guidance.")
+    async def get_account_profile(account_name: str | None = None) -> GetAccountProfileResult:
+        return build_account_profile_result(runtime_settings, account_name=account_name)
 
     @server.tool(name="get_current_datetime", description="Return the current UTC date and time.")
     async def get_current_datetime() -> CurrentDatetimeResult:
@@ -289,6 +356,26 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
             return GetThreadResult(status="error", message_id=message_id, details=str(exc))
         return await service.get_thread(message_id=message_id, account_name=None, mailbox=mailbox)
 
+    @server.tool(name="get_stored_email_context", description="Return stored historical email context from Supabase for a reply target or subject.")
+    async def get_stored_email_context(
+        reply_email_id: str | None = None,
+        subject: str | None = None,
+        account_name: str | None = None,
+        mailbox: str = "INBOX",
+        limit: int = 10,
+    ) -> GetStoredEmailContextResult:
+        try:
+            service = resolve_service(account_name=account_name)
+        except ValueError as exc:
+            return GetStoredEmailContextResult(status="error", anchor_email_id=reply_email_id, details=str(exc))
+        return await service.get_stored_email_context(
+            reply_email_id=reply_email_id,
+            subject=subject,
+            account_name=None,
+            mailbox=mailbox,
+            limit=limit,
+        )
+
     @server.tool(name="mark_email", description="Mark emails as seen, flagged, or answered.")
     async def mark_email(
         email_ids: list[str],
@@ -349,7 +436,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     fastapi_app = FastAPI(title=runtime_settings.app_name, lifespan=mcp_http_app.lifespan)
 
+    @fastapi_app.middleware("http")
+    async def normalize_mcp_root_path(request: Request, call_next):
+        if request.scope.get("path") == "/mcp":
+            request.scope["path"] = "/mcp/"
+            request.scope["raw_path"] = b"/mcp/"
+        return await call_next(request)
+
     @fastapi_app.get("/healthz", response_model=ServiceHealth)
+    @fastapi_app.get("/healthz/", response_model=ServiceHealth, include_in_schema=False)
     async def healthz(account_name: str | None = None) -> ServiceHealth:
         return build_service_health(runtime_settings, account_name=account_name)
 

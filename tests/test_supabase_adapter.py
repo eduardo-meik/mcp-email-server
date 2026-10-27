@@ -86,6 +86,50 @@ async def test_supabase_adapter_uses_real_email_schema_and_tracks_state() -> Non
     assert state_payload == [{"mailbox_id": "contacto", "folder": "INBOX", "last_uid": 5574}]
 
 
+@pytest.mark.asyncio
+async def test_supabase_adapter_returns_stored_email_context_for_normalized_subject() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/rest/v1/email_embeddings":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "mailbox_id": "contacto",
+                        "folder": "INBOX",
+                        "message_id": "<a@example.com>",
+                        "subject": "Re: Contract update",
+                        "from_addr": "sender@example.com",
+                        "to_addr": "alice@example.com, bob@example.com",
+                        "date": "2026-04-12T10:00:00+00:00",
+                        "body_text": "Latest follow-up",
+                    },
+                    {
+                        "mailbox_id": "contacto",
+                        "folder": "INBOX",
+                        "message_id": "<b@example.com>",
+                        "subject": "Other topic",
+                        "from_addr": "other@example.com",
+                        "to_addr": "alice@example.com",
+                        "date": "2026-04-11T10:00:00+00:00",
+                        "body_text": "Ignore me",
+                    },
+                ],
+            )
+        return httpx.Response(404, json={"error": "unexpected request"})
+
+    adapter = SupabaseAdapter(build_settings(), transport=httpx.MockTransport(handler))
+
+    normalized_subject, emails = await adapter.get_stored_email_context(
+        mailbox_id="contacto",
+        subject="Fwd: Re: Contract update",
+        limit=5,
+    )
+
+    assert normalized_subject == "Contract update"
+    assert [email.message_id for email in emails] == ["<a@example.com>"]
+    assert emails[0].to_addresses == ["alice@example.com", "bob@example.com"]
+
+
 def test_email_message_and_embedding_are_sanitized_before_persisting() -> None:
     embedded_email = EmbeddedEmail(
         message=EmailMessage(

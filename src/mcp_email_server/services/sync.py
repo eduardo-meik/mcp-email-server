@@ -13,6 +13,7 @@ from mcp_email_server.models import (
     EmailActionResult,
     EmailAccount,
     GetEmailsContentResult,
+    GetStoredEmailContextResult,
     GetThreadResult,
     ListEmailsResult,
     ListMailboxesResult,
@@ -48,6 +49,7 @@ class EmailSyncService:
                     raise AdapterExecutionError(f"Reply target not found: {reply_email_id}")
                 parent_message = parent_messages[0]
                 message = self._prepare_reply_message(message=message, parent_message=parent_message)
+            message = self._smtp_adapter.with_required_bcc(message)
             message_id = await self._smtp_adapter.send_email(message)
         except AdapterConfigurationError as exc:
             return SendEmailResult(
@@ -182,6 +184,49 @@ class EmailSyncService:
             return GetThreadResult(status="error", message_id=message_id, details=str(exc))
 
         return GetThreadResult(status="ok", message_id=message_id, emails=emails)
+
+    async def get_stored_email_context(
+        self,
+        reply_email_id: str | None = None,
+        subject: str | None = None,
+        account_name: str | None = None,
+        mailbox: str | None = None,
+        limit: int = 10,
+    ) -> GetStoredEmailContextResult:
+        try:
+            self._validate_account_name(account_name)
+            anchor_subject = subject.strip() if subject else None
+            if reply_email_id:
+                parent_messages = await self._imap_adapter.get_emails_content(email_ids=[reply_email_id], mailbox=mailbox)
+                if not parent_messages:
+                    raise AdapterExecutionError(f"Reply target not found: {reply_email_id}")
+                if not anchor_subject:
+                    anchor_subject = parent_messages[0].subject
+
+            if not anchor_subject:
+                raise AdapterExecutionError("A reply_email_id or non-empty subject is required to load stored email context")
+
+            normalized_subject, emails = await self._supabase_adapter.get_stored_email_context(
+                mailbox_id=self._imap_adapter.mailbox_id,
+                subject=anchor_subject,
+                limit=limit,
+            )
+        except AdapterConfigurationError as exc:
+            return GetStoredEmailContextResult(
+                status="blocked",
+                anchor_email_id=reply_email_id,
+                details=str(exc),
+                missing_configuration=exc.missing_configuration,
+            )
+        except AdapterExecutionError as exc:
+            return GetStoredEmailContextResult(status="error", anchor_email_id=reply_email_id, details=str(exc))
+
+        return GetStoredEmailContextResult(
+            status="ok",
+            anchor_email_id=reply_email_id,
+            normalized_subject=normalized_subject,
+            emails=emails,
+        )
 
     async def search_emails(
         self,

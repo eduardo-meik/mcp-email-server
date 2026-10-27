@@ -1,6 +1,8 @@
+from datetime import datetime, timezone
+
 import pytest
 
-from mcp_email_server.models import EmailContent, OutboundEmail
+from mcp_email_server.models import EmailContent, OutboundEmail, StoredEmailContext
 from mcp_email_server.services.sync import EmailSyncService
 
 
@@ -50,6 +52,10 @@ class FakeSmtpAdapter:
     def __init__(self) -> None:
         self.sent_message = None
 
+    def with_required_bcc(self, message: OutboundEmail) -> OutboundEmail:
+        merged_bcc = list(dict.fromkeys([*message.bcc, "4452112@bcc.hubspot.com"]))
+        return message.model_copy(update={"bcc": merged_bcc})
+
     async def send_email(self, message: OutboundEmail) -> str:
         self.sent_message = message
         return "<sent@example.com>"
@@ -61,14 +67,34 @@ class FakeOpenRouterAdapter:
 
 
 class FakeSupabaseAdapter:
-    async def get_last_uid(self, mailbox_id: str, folder: str):
+    async def get_last_uid(self, _mailbox_id: str, _folder: str):
+        _ = (_mailbox_id, _folder)
         return None
 
     async def persist_emails(self, embedded_emails):
         return len(embedded_emails)
 
-    async def upsert_ingest_state(self, mailbox_id: str, folder: str, last_uid: int) -> None:
+    async def upsert_ingest_state(self, _mailbox_id: str, _folder: str, _last_uid: int) -> None:
+        _ = (_mailbox_id, _folder, _last_uid)
         return None
+
+    async def get_stored_email_context(self, mailbox_id: str, subject: str, limit: int = 10):
+        _ = (mailbox_id, limit)
+        return (
+            subject,
+            [
+                StoredEmailContext(
+                    mailbox_id="agent",
+                    folder="INBOX",
+                    message_id="<historic@example.com>",
+                    subject=subject,
+                    from_address="sender@example.com",
+                    to_addresses=["agent@test.local"],
+                    received_at=datetime(2026, 4, 12, 10, 0, tzinfo=timezone.utc),
+                    body_text="Historic thread context",
+                )
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -93,6 +119,7 @@ async def test_send_email_enriches_thread_headers_when_reply_email_id_is_provide
     )
 
     assert result.status == "ok"
+    assert result.accepted_recipients == ["sender@example.com", "4452112@bcc.hubspot.com"]
     assert imap_adapter.requested_email_ids == ["INBOX:10"]
     assert smtp_adapter.sent_message.subject == "Re: Status update"
     assert smtp_adapter.sent_message.in_reply_to == "<parent@example.com>"
@@ -113,3 +140,20 @@ async def test_get_thread_returns_thread_emails() -> None:
     assert result.status == "ok"
     assert result.message_id == "<thread@example.com>"
     assert [email.message_id for email in result.emails] == ["<thread@example.com>"]
+
+
+@pytest.mark.asyncio
+async def test_get_stored_email_context_uses_reply_subject_and_supabase_history() -> None:
+    service = EmailSyncService(
+        imap_adapter=FakeImapAdapter(),
+        openrouter_adapter=FakeOpenRouterAdapter(),
+        smtp_adapter=FakeSmtpAdapter(),
+        supabase_adapter=FakeSupabaseAdapter(),
+    )
+
+    result = await service.get_stored_email_context(reply_email_id="INBOX:10", mailbox="INBOX")
+
+    assert result.status == "ok"
+    assert result.anchor_email_id == "INBOX:10"
+    assert result.normalized_subject == "Status update"
+    assert [email.message_id for email in result.emails] == ["<historic@example.com>"]

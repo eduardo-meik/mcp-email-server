@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from mcp_email_server.config import Settings
 from mcp_email_server.models import SyncRunResult
-from mcp_email_server.server import build_mcp_server, build_service, configured_accounts, create_app
+from mcp_email_server.server import build_account_profile, build_mcp_server, configured_accounts, create_app
 
 
 def test_mcp_initialize_succeeds_through_fastapi_mount() -> None:
@@ -31,6 +31,40 @@ def test_mcp_initialize_succeeds_through_fastapi_mount() -> None:
     assert '"name":"mcp-email-server"' in response.text
 
 
+def test_mcp_initialize_succeeds_without_trailing_slash() -> None:
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers={"Accept": "application/json, text/event-stream"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1.0"},
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert '"jsonrpc":"2.0"' in response.text
+    assert '"name":"mcp-email-server"' in response.text
+
+
+def test_healthz_succeeds_with_trailing_slash() -> None:
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/healthz/")
+
+    assert response.status_code == 200
+    assert response.json()["app_name"] == "mcp-email-server"
+
+
 def test_mcp_server_registers_mvp_mailbox_tools() -> None:
     tool_names = {tool.name for tool in asyncio.run(build_mcp_server().list_tools())}
 
@@ -39,19 +73,35 @@ def test_mcp_server_registers_mvp_mailbox_tools() -> None:
         "sync_unread_emails",
         "send_email",
         "list_available_accounts",
+        "get_account_profile",
         "get_current_datetime",
         "list_mailboxes",
         "list_emails_metadata",
         "get_emails_content",
         "search_emails",
         "get_thread",
+        "get_stored_email_context",
         "mark_email",
         "move_email",
         "delete_emails",
     }.issubset(tool_names)
 
 
-def test_build_service_and_account_listing_support_multiple_accounts() -> None:
+def test_send_email_tool_exposes_attachment_schema() -> None:
+    send_tool = next(tool for tool in asyncio.run(build_mcp_server().list_tools()) if tool.name == "send_email")
+
+    assert "attachments" in send_tool.description
+    assert "attachments" in send_tool.parameters["properties"]
+    assert "content_text" in send_tool.parameters["properties"]["attachments"]["description"]
+    attachment_items = send_tool.parameters["properties"]["attachments"]["anyOf"][0]["items"]
+    assert attachment_items["properties"]["filename"]["type"] == "string"
+    assert attachment_items["properties"]["content_base64"]["anyOf"][0]["type"] == "string"
+    assert "content_text" in attachment_items["properties"]
+    assert "application/pdf" in attachment_items["properties"]["content_text"]["description"]
+    assert attachment_items["required"] == ["filename"]
+
+
+def test_account_listing_and_profile_support_multiple_accounts() -> None:
     settings = Settings(
         _env_file=None,
         imap_host="mail.shared.local",
@@ -60,18 +110,22 @@ def test_build_service_and_account_listing_support_multiple_accounts() -> None:
         supabase_url="https://example.supabase.co",
         supabase_service_role_key="supabase-secret",
         accounts_json='['
-        '{"account_name":"sales","mailbox_id":"sales-box","imap_username":"sales@example.com","imap_password":"sales-pass","smtp_username":"sales@example.com","smtp_password":"sales-pass","smtp_from_address":"sales@example.com"},'
-        '{"account_name":"support","mailbox_id":"support-box","imap_username":"support@example.com","imap_password":"support-pass","smtp_username":"support@example.com","smtp_password":"support-pass","smtp_from_address":"support@example.com"}'
+        '{"account_name":"sales","mailbox_id":"sales-box","imap_username":"sales@example.com","imap_password":"sales-pass","smtp_username":"sales@example.com","smtp_password":"sales-pass","smtp_from_address":"sales@example.com","persona_name":"Sales closer"},'
+        '{"account_name":"support","mailbox_id":"support-box","imap_username":"support@example.com","imap_password":"support-pass","smtp_username":"support@example.com","smtp_password":"support-pass","smtp_from_address":"support@example.com","persona_name":"Support advisor","persona_instructions":"Be calm and solution-oriented.","signature":"Support Desk"}'
         ']',
     )
 
     accounts = configured_accounts(settings)
-    support_service = build_service(settings, account_name="support")
+    support_profile = build_account_profile(settings, account_name="support")
+    support = settings.for_account("support")
 
     assert [account.account_name for account in accounts] == ["sales", "support"]
     assert [account.mailbox_id for account in accounts] == ["sales-box", "support-box"]
-    assert support_service._imap_adapter.email_address == "support@example.com"
-    assert support_service._imap_adapter.mailbox_id == "support-box"
+    assert [account.persona_name for account in accounts] == ["Sales closer", "Support advisor"]
+    assert support.imap_username == "support@example.com"
+    assert support.resolved_mailbox_id() == "support-box"
+    assert support_profile.persona_instructions == "Be calm and solution-oriented."
+    assert support_profile.signature == "Support Desk"
 
 
 def test_tasks_poll_allows_requests_when_secret_is_not_configured(monkeypatch) -> None:
@@ -80,6 +134,7 @@ def test_tasks_poll_allows_requests_when_secret_is_not_configured(monkeypatch) -
             return SyncRunResult(status="ok", fetched=1, embedded=1, persisted=1, last_uid=limit)
 
     def fake_build_service(settings: Settings | None = None, account_name: str | None = None) -> DummyService:
+        _ = (settings, account_name)
         return DummyService()
 
     monkeypatch.setattr("mcp_email_server.server.build_service", fake_build_service)
@@ -102,6 +157,7 @@ def test_tasks_poll_rejects_requests_with_missing_or_invalid_secret(monkeypatch)
             return SyncRunResult(status="ok", fetched=1, embedded=1, persisted=1, last_uid=limit)
 
     def fake_build_service(settings: Settings | None = None, account_name: str | None = None) -> DummyService:
+        _ = (settings, account_name)
         calls["count"] += 1
         return DummyService()
 
@@ -124,6 +180,7 @@ def test_tasks_poll_accepts_requests_with_valid_secret(monkeypatch) -> None:
             return SyncRunResult(status="ok", fetched=2, embedded=2, persisted=2, last_uid=limit)
 
     def fake_build_service(settings: Settings | None = None, account_name: str | None = None) -> DummyService:
+        _ = (settings, account_name)
         return DummyService()
 
     monkeypatch.setattr("mcp_email_server.server.build_service", fake_build_service)
