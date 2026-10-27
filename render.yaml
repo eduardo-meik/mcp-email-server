@@ -17,6 +17,8 @@ services:
         sync: false
       - key: MCP_EMAIL_POLL_WEBHOOK_SECRET
         sync: false
+      - key: MCP_EMAIL_ACCESS_TOKEN
+        sync: false
       - key: MCP_EMAIL_IMAP_MAILBOX
         value: INBOX
       - key: MCP_EMAIL_OPENROUTER_BASE_URL

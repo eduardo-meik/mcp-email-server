@@ -26,13 +26,15 @@ Claude should prefer MCP tools from this server for real inbox operations, not s
 - SMTP adapter: `aiosmtplib`
 - MCP framework: `FastMCP`
 - Web framework: `FastAPI`
-- Production MCP URL: `https://mcp-email-server-y2eagv4zlq-uc.a.run.app/mcp`
-- Production MCP URL with trailing slash: `https://mcp-email-server-y2eagv4zlq-uc.a.run.app/mcp/`
-- Local MCP URL: `http://localhost:8000/mcp`
+- Production MCP URL: `https://mcp-email-server-y2eagv4zlq-uc.a.run.app/mcp` plus the request header `Authorization: Bearer <MCP_EMAIL_ACCESS_TOKEN>` (preferred: the token stays out of the URL)
+- Alternative when headers are not available: `https://mcp-email-server-y2eagv4zlq-uc.a.run.app/mcp/<MCP_EMAIL_ACCESS_TOKEN>`
+- The token is a secret kept in Secret Manager and the local `.env`; never write it into this file
+- Without the token only the MCP handshake (`initialize`, `ping`, `tools/list`) answers; any other call returns `401`
+- Local MCP URL: `http://localhost:8000/mcp` (no token needed when `MCP_EMAIL_ACCESS_TOKEN` is unset)
 - Local health endpoint: `http://localhost:8000/healthz`
 - Local poll endpoint: `http://localhost:8000/tasks/poll`
 
-The production deployment has been validated for MCP `initialize` on both `/mcp` and `/mcp/`.
+The production deployment has been validated for MCP `initialize` with the token in the path, with or without a trailing slash, and with the bearer header.
 
 ## When Claude Should Use This Skill
 

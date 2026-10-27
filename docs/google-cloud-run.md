@@ -47,6 +47,7 @@ Configura estas variables en Cloud Run:
 - `MCP_EMAIL_SUPABASE_URL`
 - `MCP_EMAIL_SUPABASE_SERVICE_ROLE_KEY`
 - `MCP_EMAIL_POLL_WEBHOOK_SECRET`
+- `MCP_EMAIL_ACCESS_TOKEN` (protege `/mcp`; ver la sección MCP)
 
 ## Valores típicos de CPanel
 
@@ -133,11 +134,10 @@ curl -X POST https://TU-SERVICIO-URL/tasks/poll \
 
 ### MCP
 
-El endpoint MCP queda publicado en:
+Con `MCP_EMAIL_ACCESS_TOKEN` definido, `/mcp` exige el token para cualquier llamada que toque datos (`tools/call`). Sin token solo responde el saludo del protocolo (`initialize`, `ping`, `tools/list`), porque el asistente de conectores de Claude hace su chequeo inicial antes de dejarte agregar headers; todo lo demás devuelve `401`. El token se entrega de dos formas:
 
-```text
-https://TU-SERVICIO-URL/mcp
-```
+- Header `Authorization: Bearer TU_TOKEN` sobre `https://TU-SERVICIO-URL/mcp` (recomendado: Claude guarda los headers de forma segura y no los vuelve a mostrar).
+- Dentro de la ruta: `https://TU-SERVICIO-URL/mcp/TU_TOKEN`, para clientes que no permiten headers. Genera el token con `python -c "import secrets; print(secrets.token_urlsafe(32))"`, guárdalo en Secret Manager como `mcp-email-access-token` y mantén `MCP_EMAIL_ACCESS_TOKEN` en el `--set-secrets` de [cloudbuild.yaml](/c:/Meik_Apps/Tools/mcp-email-server-2/cloudbuild.yaml): ese flag reemplaza todos los secretos, y si se omite el endpoint queda público. Si `MCP_EMAIL_ENV=production` y el token falta, el servidor lo avisa en el log al arrancar.
 
 ## Recomendación operativa
 

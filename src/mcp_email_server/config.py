@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     poll_batch_size: int = 25
     poll_webhook_secret: SecretStr | None = None
+    access_token: SecretStr | None = None
     accounts_json: str | None = None
     persona_name: str | None = None
     persona_instructions: str | None = None
@@ -253,6 +254,11 @@ class Settings(BaseSettings):
         if self._is_missing_secret(self.poll_webhook_secret):
             return None
         return self.poll_webhook_secret.get_secret_value()
+
+    def resolved_access_token(self) -> str | None:
+        if self._is_missing_secret(self.access_token):
+            return None
+        return self.access_token.get_secret_value().strip()
 
     def _default_account_config(self) -> EmailAccountConfig:
         return EmailAccountConfig(
