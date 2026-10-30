@@ -203,9 +203,12 @@ Exportar alertas por `unknown > 0`, crecimiento de `failed` y errores de persist
    la misma clave podria producir otro envio. `mcp_quoter` debe usar claves
    globalmente unicas y no reenviar claves historicas despues de la retencion.
 4. Provisionar los secretos y la cuenta fija en staging; en Render agregarlos al
-   entorno del servicio, en Cloud Run a Secret Manager/env preservando todos los
-   secretos existentes en `--set-secrets`. Esta entrega no altera el despliegue
-   existente para activar una cuenta o credencial no confirmada.
+   entorno del servicio, en Cloud Run a Secret Manager/env preservando los
+   secretos y variables existentes con `--update-secrets` y `--update-env-vars`.
+   Publicar `mcp_email_server.server:application`, no solo la instancia MCP.
+   El servicio de correo confirmado, la cuenta fija y las verificaciones
+   productivas estan en [README.md](../README.md). Al rotar, mover tambien el
+   trafico y los tags que apunten a revisiones con credenciales anteriores.
 5. Configurar proxy/gateway para no registrar Authorization, cuerpo ni query
    strings sensibles. Uvicorn del contenedor tiene access logs desactivados.
    Los logs automaticos de la plataforma requieren configuracion independiente.
