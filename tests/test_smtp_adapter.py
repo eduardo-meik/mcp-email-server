@@ -10,7 +10,7 @@ from mcp_email_server.models import OutboundAttachment, OutboundEmail
 
 
 class FakeSmtpClient:
-    def __init__(self, *, hostname: str, port: int, use_tls: bool) -> None:
+    def __init__(self, *, hostname: str, port: int, use_tls: bool, timeout: float = 30) -> None:
         self.hostname = hostname
         self.port = port
         self.use_tls = use_tls

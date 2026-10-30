@@ -27,14 +27,17 @@ Claude should prefer MCP tools from this server for real inbox operations, not s
 - MCP framework: `FastMCP`
 - Web framework: `FastAPI`
 - Production MCP URL: `https://mcp-email-server-y2eagv4zlq-uc.a.run.app/mcp` plus the request header `Authorization: Bearer <MCP_EMAIL_ACCESS_TOKEN>` (preferred: the token stays out of the URL)
-- Alternative when headers are not available: `https://mcp-email-server-y2eagv4zlq-uc.a.run.app/mcp/<MCP_EMAIL_ACCESS_TOKEN>`
+- Tokens in paths or query strings are not supported. Clients must send a bearer header.
 - The token is a secret kept in Secret Manager and the local `.env`; never write it into this file
-- Without the token only the MCP handshake (`initialize`, `ping`, `tools/list`) answers; any other call returns `401`
-- Local MCP URL: `http://localhost:8000/mcp` (no token needed when `MCP_EMAIL_ACCESS_TOKEN` is unset)
+- Every MCP request, including `initialize`, `ping` and `tools/list`, requires the token.
+- Local MCP URL: `http://localhost:8000/mcp` (requires `MCP_EMAIL_ACCESS_TOKEN` too)
 - Local health endpoint: `http://localhost:8000/healthz`
 - Local poll endpoint: `http://localhost:8000/tasks/poll`
 
-The production deployment has been validated for MCP `initialize` with the token in the path, with or without a trailing slash, and with the bearer header.
+Only bearer authentication is supported, with or without a trailing slash.
+Official quotation PDFs must travel directly from `mcp_quoter` to the restricted
+HTTP contract in [docs/quotation-delivery.md](docs/quotation-delivery.md).
+Claude must not transport their Base64 or regenerate the official PDF.
 
 ## When Claude Should Use This Skill
 

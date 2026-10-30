@@ -1,6 +1,4 @@
 from datetime import datetime
-import json
-import logging
 from secrets import compare_digest
 from typing import Annotated
 
@@ -9,7 +7,7 @@ from fastapi.responses import JSONResponse
 from fastmcp import FastMCP
 from pydantic import Field
 from starlette.datastructures import Headers
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from mcp_email_server.adapters import ImapAdapter, OpenRouterAdapter, SmtpAdapter, SupabaseAdapter
 from mcp_email_server.config import Settings, get_settings
@@ -32,6 +30,7 @@ from mcp_email_server.models import (
     SyncRunResult,
 )
 from mcp_email_server.services import EmailSyncService
+from mcp_email_server.quotation_api import install_quotation_api
 
 
 def build_service(settings: Settings | None = None, account_name: str | None = None) -> EmailSyncService:
@@ -113,41 +112,12 @@ def _tokens_match(provided: str, expected: str) -> bool:
 
 def authorize_mcp_path(path: str, authorization: str | None, expected_token: str | None) -> str | None:
     """Return the path to route to the MCP app, or None when the request is not authorized."""
-    if expected_token is None:
-        return "/mcp/" if path == "/mcp" else path
-
-    segments = path.split("/")
-    if len(segments) > 2 and _tokens_match(segments[2], expected_token):
-        return "/mcp/" + "/".join(segments[3:])
-
+    if path not in ("/mcp", "/mcp/") or expected_token is None:
+        return None
     if authorization and authorization.startswith("Bearer ") and _tokens_match(authorization[7:].strip(), expected_token):
         return "/mcp/" if path == "/mcp" else path
 
     return None
-
-
-# Claude's connector check runs before it lets you add headers, so the handshake must work without a token.
-OPEN_MCP_METHODS = frozenset(
-    {
-        "initialize",
-        "notifications/initialized",
-        "ping",
-        "tools/list",
-        "prompts/list",
-        "resources/list",
-        "resources/templates/list",
-    }
-)
-MAX_UNAUTHENTICATED_BODY_BYTES = 16 * 1024
-
-
-def is_open_mcp_payload(body: bytes) -> bool:
-    try:
-        payload = json.loads(body)
-    except ValueError:
-        return False
-    messages = payload if isinstance(payload, list) else [payload]
-    return bool(messages) and all(isinstance(item, dict) and item.get("method") in OPEN_MCP_METHODS for item in messages)
 
 
 class McpAccessGuard:
@@ -166,11 +136,7 @@ class McpAccessGuard:
             await self._forward(scope, receive, send, routed_path)
             return
 
-        if scope["method"] == "POST" and path in ("/mcp", "/mcp/"):
-            body, replay = await self._buffer_body(receive)
-            if body is not None and is_open_mcp_payload(body):
-                await self._forward(scope, replay, send, "/mcp/")
-                return
+        if path in ("/mcp", "/mcp/"):
             response = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
         else:
             response = JSONResponse({"detail": "Not Found"}, status_code=status.HTTP_404_NOT_FOUND)
@@ -179,38 +145,9 @@ class McpAccessGuard:
     async def _forward(self, scope: Scope, receive: Receive, send: Send, routed_path: str) -> None:
         await self.app({**scope, "path": routed_path, "raw_path": routed_path.encode()}, receive, send)
 
-    @staticmethod
-    async def _buffer_body(receive: Receive) -> tuple[bytes | None, Receive]:
-        messages: list[Message] = []
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            message = await receive()
-            messages.append(message)
-            if message["type"] != "http.request":
-                return None, receive
-            chunk = message.get("body", b"")
-            size += len(chunk)
-            if size > MAX_UNAUTHENTICATED_BODY_BYTES:
-                return None, receive
-            chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
-
-        async def replay() -> Message:
-            if messages:
-                return messages.pop(0)
-            return await receive()
-
-        return b"".join(chunks), replay
-
-
 def verify_poll_webhook_secret(settings: Settings, provided_secret: str | None) -> None:
     expected_secret = settings.resolved_poll_webhook_secret()
-    if expected_secret is None:
-        return
-
-    if provided_secret is None or not compare_digest(provided_secret, expected_secret):
+    if expected_secret is None or provided_secret is None or not _tokens_match(provided_secret, expected_secret):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing webhook secret.",
@@ -534,15 +471,15 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     runtime_settings = settings or get_settings()
+    if runtime_settings.env.strip().lower() in {"production", "prod"} and runtime_settings.resolved_access_token() is None:
+        raise ValueError("MCP_EMAIL_ACCESS_TOKEN is required in production and must not be a placeholder")
     mcp_server = build_mcp_server(runtime_settings)
     mcp_http_app = mcp_server.http_app(path="/", stateless_http=True)
 
     fastapi_app = FastAPI(title=runtime_settings.app_name, lifespan=mcp_http_app.lifespan)
 
-    if runtime_settings.env == "production" and runtime_settings.resolved_access_token() is None:
-        logging.getLogger(__name__).warning("MCP_EMAIL_ACCESS_TOKEN is not set: /mcp is publicly accessible")
-
     fastapi_app.add_middleware(McpAccessGuard, expected_token=runtime_settings.resolved_access_token())
+    install_quotation_api(fastapi_app, runtime_settings)
 
     @fastapi_app.get("/healthz", response_model=ServiceHealth)
     @fastapi_app.get("/healthz/", response_model=ServiceHealth, include_in_schema=False)
@@ -573,7 +510,7 @@ def main() -> None:
     import uvicorn
 
     settings = get_settings()
-    uvicorn.run(application, host=settings.server_host, port=settings.server_port)
+    uvicorn.run(application, host=settings.server_host, port=settings.server_port, access_log=False)
 
 if __name__ == "__main__":
     main()

@@ -134,10 +134,31 @@ curl -X POST https://TU-SERVICIO-URL/tasks/poll \
 
 ### MCP
 
-Con `MCP_EMAIL_ACCESS_TOKEN` definido, `/mcp` exige el token para cualquier llamada que toque datos (`tools/call`). Sin token solo responde el saludo del protocolo (`initialize`, `ping`, `tools/list`), porque el asistente de conectores de Claude hace su chequeo inicial antes de dejarte agregar headers; todo lo demás devuelve `401`. El token se entrega de dos formas:
+`/mcp` exige `MCP_EMAIL_ACCESS_TOKEN` en **todas** las solicitudes, incluido
+`initialize`, `ping` y `tools/list`. Sin credenciales responde `401`, incluso en
+desarrollo. En produccion, un token ausente o placeholder impide el arranque.
+Los clientes existentes conservan herramientas y argumentos, pero deben enviar
+el header desde el primer handshake; no se mantiene el acceso abierto anterior.
 
 - Header `Authorization: Bearer TU_TOKEN` sobre `https://TU-SERVICIO-URL/mcp` (recomendado: Claude guarda los headers de forma segura y no los vuelve a mostrar).
-- Dentro de la ruta: `https://TU-SERVICIO-URL/mcp/TU_TOKEN`, para clientes que no permiten headers. Genera el token con `python -c "import secrets; print(secrets.token_urlsafe(32))"`, guárdalo en Secret Manager como `mcp-email-access-token` y mantén `MCP_EMAIL_ACCESS_TOKEN` en el `--set-secrets` de [cloudbuild.yaml](/c:/Meik_Apps/Tools/mcp-email-server-2/cloudbuild.yaml): ese flag reemplaza todos los secretos, y si se omite el endpoint queda público. Si `MCP_EMAIL_ENV=production` y el token falta, el servidor lo avisa en el log al arrancar.
+- No se aceptan tokens en rutas ni query strings. Rota cualquier token usado
+  anteriormente en URLs y elimina/redacta esos registros en proxies y plataforma.
+- Genera el token con `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+  y guardalo en Secret Manager como `mcp-email-access-token`. Conserva todos los
+  secretos al modificar `--set-secrets` en [cloudbuild.yaml](../cloudbuild.yaml).
+- El contenedor deshabilita access logs de Uvicorn. Configura tambien los logs del
+  proxy/plataforma para no registrar Authorization, cuerpos ni antiguas URLs secretas.
+- `/tasks/poll` queda deshabilitado sin `MCP_EMAIL_POLL_WEBHOOK_SECRET`.
+
+### Cotizaciones servidor a servidor
+
+Aplica [la migracion](../scripts/create_quotation_send_attempts.sql) en staging y
+configura `MCP_EMAIL_QUOTER_TOKEN` (secreto exclusivo de al menos 32 caracteres) y
+`MCP_EMAIL_QUOTER_ACCOUNT` (nombre de la cuenta emisora).
+En Cloud Run, agrega el primero como secreto y el segundo como variable de entorno
+conservando los valores existentes; la API permanece deshabilitada si ambos faltan.
+No compartir estas credenciales con Claude ni con clientes MCP generales.
+Consulta [contrato, estados y validacion previa al despliegue](quotation-delivery.md).
 
 ## Recomendación operativa
 

@@ -1,7 +1,9 @@
 from mcp_email_server.schemas import (
 	AccountProfile,
+	AttachmentMetadata,
 	AvailableAccountsResult,
 	CurrentDatetimeResult,
+	DownloadAttachmentResult,
 	EmailActionResult,
 	EmailAccount,
 	EmailContent,
@@ -25,8 +27,10 @@ from mcp_email_server.schemas import (
 
 __all__ = [
 	"AccountProfile",
+	"AttachmentMetadata",
 	"AvailableAccountsResult",
 	"CurrentDatetimeResult",
+	"DownloadAttachmentResult",
 	"EmailActionResult",
 	"EmailAccount",
 	"EmailContent",

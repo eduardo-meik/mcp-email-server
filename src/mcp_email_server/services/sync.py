@@ -2,14 +2,17 @@ from datetime import datetime, timezone
 
 import httpx
 
+from mcp_email_server.adapters.clamav import ClamAvAdapter
 from mcp_email_server.adapters.errors import AdapterConfigurationError, AdapterExecutionError
 from mcp_email_server.adapters.imap import ImapAdapter
 from mcp_email_server.adapters.openrouter import OpenRouterAdapter
 from mcp_email_server.adapters.smtp import SmtpAdapter
+from mcp_email_server.adapters.storage import StorageAdapter
 from mcp_email_server.adapters.supabase import SupabaseAdapter
 from mcp_email_server.models import (
     AvailableAccountsResult,
     CurrentDatetimeResult,
+    DownloadAttachmentResult,
     EmailActionResult,
     EmailAccount,
     GetEmailsContentResult,
@@ -21,6 +24,7 @@ from mcp_email_server.models import (
     SendEmailResult,
     SyncRunResult,
 )
+from mcp_email_server.services.attachments import AttachmentService
 
 
 class EmailSyncService:
@@ -30,11 +34,34 @@ class EmailSyncService:
         openrouter_adapter: OpenRouterAdapter,
         smtp_adapter: SmtpAdapter,
         supabase_adapter: SupabaseAdapter,
+        storage_adapter: StorageAdapter | None = None,
+        clamav_adapter: ClamAvAdapter | None = None,
     ) -> None:
         self._imap_adapter = imap_adapter
         self._openrouter_adapter = openrouter_adapter
         self._smtp_adapter = smtp_adapter
         self._supabase_adapter = supabase_adapter
+        self._storage_adapter = storage_adapter
+        self._clamav_adapter = clamav_adapter
+
+    async def download_attachment(
+        self,
+        email_id: str,
+        part_id: str,
+        include_text: bool = False,
+        text_offset: int = 0,
+        max_chars: int = 6000,
+    ) -> DownloadAttachmentResult:
+        if self._storage_adapter is None or self._clamav_adapter is None:
+            return DownloadAttachmentResult(status="error", details="attachment pipeline is not configured")
+        service = self._build_attachment_service()
+        return await service.download_attachment(
+            email_id=email_id,
+            part_id=part_id,
+            include_text=include_text,
+            text_offset=text_offset,
+            max_chars=max_chars,
+        )
 
     async def send_email(
         self,
@@ -318,6 +345,8 @@ class EmailSyncService:
         return EmailActionResult(status="ok", email_ids=deleted_ids, count=len(deleted_ids))
 
     async def sync_unread_emails(self, limit: int) -> SyncRunResult:
+        archived = 0
+        purged = 0
         try:
             last_uid = await self._supabase_adapter.get_last_uid(
                 mailbox_id=self._imap_adapter.mailbox_id,
@@ -333,6 +362,8 @@ class EmailSyncService:
                     folder=self._imap_adapter.folder,
                     last_uid=last_uid,
                 )
+            archived = await self._auto_archive_attachments(unread_messages)
+            purged = await self._purge_expired_attachments()
         except AdapterConfigurationError as exc:
             return SyncRunResult(
                 status="blocked",
@@ -350,9 +381,91 @@ class EmailSyncService:
             fetched=len(unread_messages),
             embedded=len(embedded_messages),
             persisted=persisted,
+            attachments_archived=archived,
+            attachments_purged=purged,
             last_uid=last_uid,
             dry_run=False,
         )
+
+    def _attachments_enabled(self) -> bool:
+        if self._storage_adapter is None or self._clamav_adapter is None:
+            return False
+        settings = getattr(self._imap_adapter, "_settings", None)
+        if settings is None:
+            return False
+        return not settings.missing_supabase_config()
+
+    def _build_attachment_service(self) -> AttachmentService:
+        return AttachmentService(
+            settings=self._imap_adapter._settings,
+            imap_adapter=self._imap_adapter,
+            supabase_adapter=self._supabase_adapter,
+            storage_adapter=self._storage_adapter,
+            clamav_adapter=self._clamav_adapter,
+        )
+
+    async def _auto_archive_attachments(self, messages) -> int:
+        """Archive allowlisted senders' attachments, bounded by a per-run byte budget."""
+
+        if not messages or not self._attachments_enabled():
+            return 0
+        settings = self._imap_adapter._settings
+        if not settings.attachment_auto_archive:
+            return 0
+
+        service = self._build_attachment_service()
+        budget = settings.attachment_auto_archive_max_bytes
+        archived = 0
+        for message in messages:
+            if budget <= 0:
+                break
+            try:
+                context = await self._imap_adapter.fetch_attachment_context(
+                    ImapAdapter.build_email_id(message.folder, message.uid),
+                    mailbox=message.folder,
+                )
+            except AdapterExecutionError:
+                continue
+            for declaration in context.attachments:
+                metadata = declaration.metadata
+                if metadata.inline or metadata.size_bytes > budget:
+                    continue
+                result = await service.download_attachment(context.email_id, metadata.part_id)
+                if result.status == "ok":
+                    archived += 1
+                    budget -= result.size_bytes or metadata.size_bytes
+                    if budget <= 0:
+                        break
+        return archived
+
+    async def _purge_expired_attachments(self) -> int:
+        """Retention: delete expired rows and their storage objects (best effort)."""
+
+        if not self._attachments_enabled():
+            return 0
+        try:
+            rows = await self._supabase_adapter.list_expired_attachments()
+        except (AdapterConfigurationError, AdapterExecutionError, httpx.HTTPError):
+            return 0
+
+        deletable_ids: list[int] = []
+        for row in rows:
+            storage_path = row.get("storage_path")
+            if storage_path:
+                try:
+                    await self._storage_adapter.delete(storage_path)
+                except (AdapterConfigurationError, AdapterExecutionError, httpx.HTTPError):
+                    continue  # keep the row so the next poll retries
+            if row.get("id") is not None:
+                deletable_ids.append(int(row["id"]))
+
+        if not deletable_ids:
+            return 0
+        try:
+            await self._supabase_adapter.delete_attachment_rows(deletable_ids)
+        except (AdapterConfigurationError, AdapterExecutionError, httpx.HTTPError):
+            return 0
+        return len(deletable_ids)
 
     def _validate_account_name(self, account_name: str | None) -> None:
         if account_name is None:

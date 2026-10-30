@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn mcp_email_server.server:application --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn mcp_email_server.server:application --host 0.0.0.0 --port ${PORT:-8000} --no-access-log"]

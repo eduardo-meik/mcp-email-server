@@ -1,0 +1,35 @@
+# Builds and deploys the ClamAV scanner. Trigger this nightly from Cloud
+# Scheduler (via a Cloud Build trigger) so baked-in signatures stay fresh.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/mcp-email-server/clamav-scanner:${BUILD_ID}
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/mcp-email-server/clamav-scanner:latest
+      - scanner
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/mcp-email-server/clamav-scanner
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - clamav-scanner
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/mcp-email-server/clamav-scanner:${BUILD_ID}
+      - --region=${_REGION}
+      - --memory=2Gi
+      - --min-instances=0
+      - --max-instances=2
+      - --concurrency=4
+      - --port=8080
+      - --no-allow-unauthenticated
+substitutions:
+  _REGION: us-central1
+options:
+  machineType: E2_MEDIUM
+timeout: 1800s

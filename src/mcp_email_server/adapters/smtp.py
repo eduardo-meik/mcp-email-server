@@ -1,3 +1,6 @@
+import asyncio
+import logging
+import re
 from collections.abc import Callable
 from email.message import EmailMessage as SmtpMessage
 from email.utils import formatdate, make_msgid
@@ -8,6 +11,7 @@ import aiosmtplib
 from mcp_email_server.adapters.errors import AdapterConfigurationError, AdapterExecutionError
 from mcp_email_server.config import Settings
 from mcp_email_server.models import OutboundEmail
+from mcp_email_server.quotations import SmtpOutcome
 
 
 class SmtpAdapter:
@@ -18,6 +22,67 @@ class SmtpAdapter:
     ) -> None:
         self._settings = settings
         self._client_factory = client_factory or aiosmtplib.SMTP
+
+    async def send_tracked_email(self, message: OutboundEmail, message_id: str | None = None) -> SmtpOutcome:
+        missing = self._settings.missing_smtp_config()
+        if missing:
+            raise AdapterConfigurationError(missing)
+        sender = self._settings.resolved_smtp_from_address()
+        if sender is None:
+            raise AdapterConfigurationError(["MCP_EMAIL_SMTP_FROM_ADDRESS"])
+        message = self.with_required_bcc(message)
+        smtp_message = self._build_message(sender, message)
+        if message_id is not None:
+            smtp_message.replace_header("Message-ID", message_id)
+        message_id = str(smtp_message["Message-ID"])
+        client = self._client_factory(
+            hostname=self._settings.smtp_host,
+            port=self._settings.smtp_port,
+            use_tls=self._settings.smtp_use_tls,
+            start_tls=False,
+            timeout=self._settings.smtp_timeout_seconds,
+        )
+        sending = False
+        try:
+            async with asyncio.timeout(self._settings.quotation_timeout_seconds):
+                await client.connect()
+                if not self._settings.smtp_use_tls and self._settings.smtp_starttls:
+                    await client.starttls()
+                await client.login(
+                    self._settings.smtp_username,
+                    self._settings.smtp_password.get_secret_value(),
+                )
+                sending = True
+                refused, response = await client.send_message(
+                    smtp_message, sender=sender, recipients=message.all_recipients,
+                    timeout=self._settings.smtp_timeout_seconds,
+                )
+                refused_count = len(refused)
+                queue_match = re.search(
+                    r"\bqueued as ([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:\s|$)", response, re.IGNORECASE
+                )
+                return SmtpOutcome(
+                    state="aceptado_por_smtp", message_id=message_id,
+                    smtp_queue_id=queue_match.group(1) if queue_match else None,
+                    accepted_count=len(set(message.all_recipients)) - refused_count,
+                    refused_count=refused_count,
+                    error_code="smtp_partial_rejection" if refused_count else None,
+                )
+        except (
+            aiosmtplib.SMTPDataError,
+            aiosmtplib.SMTPSenderRefused,
+            aiosmtplib.SMTPRecipientsRefused,
+        ):
+            return SmtpOutcome(state="fallido", message_id=message_id, error_code="smtp_rejected")
+        except (aiosmtplib.SMTPException, OSError, TimeoutError):
+            return SmtpOutcome(
+                state="resultado_desconocido" if sending else "fallido",
+                message_id=message_id,
+                error_code="smtp_outcome_unknown" if sending else "smtp_connection_failed",
+            )
+        finally:
+            # A QUIT failure must never overwrite a successful DATA response.
+            client.close()
 
     async def send_email(self, message: OutboundEmail) -> str:
         missing = self._settings.missing_smtp_config()
@@ -34,6 +99,7 @@ class SmtpAdapter:
             hostname=self._settings.smtp_host,
             port=self._settings.smtp_port,
             use_tls=self._settings.smtp_use_tls,
+            timeout=self._settings.smtp_timeout_seconds,
         )
         try:
             await client.connect()
@@ -53,8 +119,8 @@ class SmtpAdapter:
         finally:
             try:
                 await client.quit()
-            except Exception:
-                pass
+            except (aiosmtplib.SMTPException, OSError, TimeoutError):
+                logging.getLogger(__name__).warning("smtp_quit_failed")
 
         message_id = smtp_message.get("Message-ID")
         if not message_id:

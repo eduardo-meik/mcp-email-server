@@ -63,6 +63,19 @@ class Settings(BaseSettings):
     poll_batch_size: int = 25
     poll_webhook_secret: SecretStr | None = None
     access_token: SecretStr | None = None
+    quoter_token: SecretStr | None = None
+    quoter_account: str | None = None
+    quotation_max_request_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    quotation_max_file_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=15 * 1024 * 1024)
+    quotation_max_total_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    quotation_max_attachments: int = Field(default=1, ge=1, le=10)
+    quotation_max_recipients: int = Field(default=20, ge=1, le=100)
+    quotation_concurrency: int = Field(default=2, ge=1, le=20)
+    quotation_per_minute: int = Field(default=10, ge=1, le=1000)
+    quotation_retention_days: int = Field(default=90, ge=1)
+    smtp_timeout_seconds: float = Field(default=30, gt=0, le=120)
+    quotation_timeout_seconds: float = Field(default=120, gt=0, le=600)
+    quotation_upload_timeout_seconds: float = Field(default=30, gt=0, le=120)
     accounts_json: str | None = None
     persona_name: str | None = None
     persona_instructions: str | None = None
@@ -94,6 +107,25 @@ class Settings(BaseSettings):
     supabase_messages_table: str = "email_embeddings"
     supabase_sync_state_table: str = "email_ingest_state"
 
+    clamav_url: str | None = None
+    clamav_auth_token: SecretStr | None = None
+    clamav_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+
+    imap_authserv_id: str | None = None
+    supabase_attachment_policy_table: str = "attachment_sender_policy"
+    supabase_attachments_table: str = "email_attachments"
+    attachment_max_count: int = Field(default=10, ge=1, le=50)
+    attachment_max_file_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    attachment_max_message_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
+    attachment_retention_days: int = Field(default=20, ge=1)
+    attachment_storage_bucket: str = "email-attachments"
+    attachment_signed_url_ttl_seconds: int = Field(default=300, ge=1, le=3600)
+    attachment_policy_cache_seconds: int = Field(default=300, ge=0)
+    attachment_extract_max_chars: int = Field(default=6000, ge=1)
+    attachment_extract_timeout_seconds: int = Field(default=30, gt=0, le=300)
+    attachment_auto_archive: bool = False
+    attachment_auto_archive_max_bytes: int = Field(default=50 * 1024 * 1024, ge=0)
+
     server_host: str = "0.0.0.0"
     server_port: int = Field(default=8000, ge=1, le=65535)
 
@@ -102,7 +134,7 @@ class Settings(BaseSettings):
         if value is None:
             return True
         normalized = value.strip()
-        return normalized in PLACEHOLDER_VALUES
+        return normalized.lower() in PLACEHOLDER_VALUES | {"changeme", "change-me", "your-token", "placeholder"}
 
     @classmethod
     def _is_missing_secret(cls, value: SecretStr | None) -> bool:
@@ -222,6 +254,27 @@ class Settings(BaseSettings):
                 return f"https://{project_ref}.supabase.co"
 
         return self.supabase_url.rstrip("/")
+
+    def resolved_clamav_url(self) -> str | None:
+        if self.clamav_url is None or self._is_missing_value(self.clamav_url):
+            return None
+        url = self.clamav_url.strip().rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        return url
+
+    def resolved_clamav_token(self) -> str | None:
+        if self.clamav_auth_token is None or self._is_missing_secret(self.clamav_auth_token):
+            return None
+        return self.clamav_auth_token.get_secret_value().strip()
+
+    def resolved_authserv_id(self) -> str | None:
+        if self.imap_authserv_id is not None and not self._is_missing_value(self.imap_authserv_id):
+            return self.imap_authserv_id.strip().lower()
+        if self.imap_host is not None and not self._is_missing_value(self.imap_host):
+            return self.imap_host.strip().lower()
+        return None
 
     def missing_supabase_config(self) -> list[str]:
         missing: list[str] = []

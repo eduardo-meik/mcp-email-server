@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mcp_email_server.config import Settings
@@ -8,12 +9,12 @@ from mcp_email_server.server import build_account_profile, build_mcp_server, con
 
 
 def test_mcp_initialize_succeeds_through_fastapi_mount() -> None:
-    app = create_app(Settings(_env_file=None))
+    app = create_app(Settings(_env_file=None, access_token="test-token"))
 
     with TestClient(app) as client:
         response = client.post(
             "/mcp/",
-            headers={"Accept": "application/json, text/event-stream"},
+            headers={"Accept": "application/json, text/event-stream", "Authorization": "Bearer test-token"},
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -32,12 +33,12 @@ def test_mcp_initialize_succeeds_through_fastapi_mount() -> None:
 
 
 def test_mcp_initialize_succeeds_without_trailing_slash() -> None:
-    app = create_app(Settings(_env_file=None))
+    app = create_app(Settings(_env_file=None, access_token="test-token"))
 
     with TestClient(app) as client:
         response = client.post(
             "/mcp",
-            headers={"Accept": "application/json, text/event-stream"},
+            headers={"Accept": "application/json, text/event-stream", "Authorization": "Bearer test-token"},
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -89,17 +90,13 @@ def _guarded_client() -> TestClient:
     return TestClient(create_app(Settings(_env_file=None, access_token="s3cret-token")))
 
 
-def test_mcp_handshake_is_open_so_claude_connector_check_passes() -> None:
+def test_mcp_handshake_requires_credentials() -> None:
     with _guarded_client() as client:
         initialize = client.post("/mcp", headers=MCP_HEADERS, json=INITIALIZE_REQUEST)
         initialize_slash = client.post("/mcp/", headers=MCP_HEADERS, json=INITIALIZE_REQUEST)
         tools_list = client.post("/mcp", headers=MCP_HEADERS, json=TOOLS_LIST_REQUEST)
 
-    assert initialize.status_code == 200
-    assert initialize_slash.status_code == 200
-    assert '"name":"mcp-email-server"' in initialize.text
-    assert tools_list.status_code == 200
-    assert "send_email" in tools_list.text
+    assert [r.status_code for r in (initialize, initialize_slash, tools_list)] == [401] * 3
 
 
 def test_mcp_tool_calls_require_the_access_token() -> None:
@@ -120,7 +117,7 @@ def test_mcp_tool_calls_require_the_access_token() -> None:
     assert wrong_path.status_code == 404
 
 
-def test_mcp_tool_calls_work_with_token_in_path_or_bearer_header() -> None:
+def test_mcp_tool_calls_require_bearer_header_and_reject_url_tokens() -> None:
     with _guarded_client() as client:
         by_path = client.post("/mcp/s3cret-token", headers=MCP_HEADERS, json=TOOL_CALL_REQUEST)
         by_path_slash = client.post("/mcp/s3cret-token/", headers=MCP_HEADERS, json=TOOL_CALL_REQUEST)
@@ -130,8 +127,8 @@ def test_mcp_tool_calls_work_with_token_in_path_or_bearer_header() -> None:
             json=TOOL_CALL_REQUEST,
         )
 
-    assert [r.status_code for r in (by_path, by_path_slash, by_bearer)] == [200] * 3
-    assert all("accounts" in r.text for r in (by_path, by_path_slash, by_bearer))
+    assert [r.status_code for r in (by_path, by_path_slash, by_bearer)] == [404, 404, 200]
+    assert "accounts" in by_bearer.text
 
 
 def test_guard_leaves_healthz_open_and_never_leaks_the_token() -> None:
@@ -207,7 +204,7 @@ def test_account_listing_and_profile_support_multiple_accounts() -> None:
     assert support_profile.signature == "Support Desk"
 
 
-def test_tasks_poll_allows_requests_when_secret_is_not_configured(monkeypatch) -> None:
+def test_tasks_poll_rejects_requests_when_secret_is_not_configured(monkeypatch) -> None:
     class DummyService:
         async def sync_unread_emails(self, limit: int) -> SyncRunResult:
             return SyncRunResult(status="ok", fetched=1, embedded=1, persisted=1, last_uid=limit)
@@ -223,9 +220,7 @@ def test_tasks_poll_allows_requests_when_secret_is_not_configured(monkeypatch) -
     with TestClient(app) as client:
         response = client.post("/tasks/poll")
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
-    assert response.json()["last_uid"] == 7
+    assert response.status_code == 401
 
 
 def test_tasks_poll_rejects_requests_with_missing_or_invalid_secret(monkeypatch) -> None:
@@ -296,6 +291,7 @@ def test_tasks_poll_syncs_all_configured_accounts_when_account_name_is_omitted(m
     settings = Settings(
         _env_file=None,
         poll_batch_size=5,
+        poll_webhook_secret="poll-secret",
         accounts_json='['
         '{"account_name":"sales","mailbox_id":"sales-box","imap_username":"sales@example.com","imap_password":"sales-pass"},'
         '{"account_name":"support","mailbox_id":"support-box","imap_username":"support@example.com","imap_password":"support-pass"}'
@@ -304,7 +300,7 @@ def test_tasks_poll_syncs_all_configured_accounts_when_account_name_is_omitted(m
     app = create_app(settings)
 
     with TestClient(app) as client:
-        response = client.post("/tasks/poll")
+        response = client.post("/tasks/poll", headers={"X-Webhook-Secret": "poll-secret"})
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
@@ -313,3 +309,14 @@ def test_tasks_poll_syncs_all_configured_accounts_when_account_name_is_omitted(m
     assert response.json()["persisted"] == 3
     assert response.json()["last_uid"] == 20
     assert calls == ["sales", "support"]
+
+
+@pytest.mark.parametrize("token", [None, "", "replace-me", "PLACEHOLDER", "changeme"])
+def test_production_requires_non_placeholder_token(token: str | None) -> None:
+    with pytest.raises(ValueError, match="MCP_EMAIL_ACCESS_TOKEN"):
+        create_app(Settings(_env_file=None, env="production", access_token=token))
+
+
+def test_development_without_token_does_not_authorize_operations() -> None:
+    with TestClient(create_app(Settings(_env_file=None))) as client:
+        assert client.post("/mcp", headers=MCP_HEADERS, json=TOOL_CALL_REQUEST).status_code == 401

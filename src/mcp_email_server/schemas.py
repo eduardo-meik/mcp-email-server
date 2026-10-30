@@ -27,6 +27,8 @@ PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 REDACTION_MARKER = "[redacted suspicious instruction]"
 MAX_LLM_TEXT_CHARS = 12000
 
+PART_ID_PATTERN = re.compile(r"^\d+(\.\d+)*$")
+
 
 def _strip_or_none(value: str | None) -> str | None:
     if value is None:
@@ -367,6 +369,8 @@ class SyncRunResult(BaseModel):
     fetched: int = 0
     embedded: int = 0
     persisted: int = 0
+    attachments_archived: int = 0
+    attachments_purged: int = 0
     last_uid: int | None = None
     dry_run: bool = False
     details: str | None = None
@@ -424,6 +428,45 @@ class ListMailboxesResult(ToolResult):
     mailboxes: list[MailboxInfo] = Field(default_factory=list)
 
 
+class AttachmentMetadata(BaseModel):
+    """Declaration of a single MIME attachment, obtained without downloading its bytes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    part_id: str = Field(description="IMAP BODYSTRUCTURE part number, for example '2' or '1.2'.")
+    filename: str | None = None
+    content_type: str = DEFAULT_CONTENT_TYPE
+    size_bytes: int = 0
+    inline: bool = False
+    content_id: str | None = None
+
+    @field_validator("part_id")
+    @classmethod
+    def _validate_part_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not PART_ID_PATTERN.match(cleaned):
+            raise ValueError("part_id must be a dotted number such as '2' or '1.2'")
+        return cleaned
+
+    @field_validator("filename", "content_id", mode="before")
+    @classmethod
+    def _normalize_optional_attachment_text(cls, value: str | None) -> str | None:
+        return _strip_or_none(value)
+
+    @field_validator("content_type", mode="before")
+    @classmethod
+    def _normalize_attachment_content_type(cls, value: str | None) -> str:
+        cleaned = _clean_text(value).lower()
+        return cleaned or DEFAULT_CONTENT_TYPE
+
+    @field_validator("size_bytes")
+    @classmethod
+    def _validate_size_bytes(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("size_bytes must not be negative")
+        return value
+
+
 class EmailMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -443,6 +486,8 @@ class EmailMetadata(BaseModel):
     flagged: bool = False
     answered: bool = False
     has_attachments: bool = False
+    attachments: list[AttachmentMetadata] = Field(default_factory=list)
+    auth_result: str | None = None
 
 
 class EmailContent(EmailMetadata):
@@ -467,6 +512,8 @@ class EmailContent(EmailMetadata):
             flagged=self.flagged,
             answered=self.answered,
             has_attachments=self.has_attachments,
+            attachments=list(self.attachments),
+            auth_result=self.auth_result,
         )
 
 
@@ -508,3 +555,33 @@ class GetStoredEmailContextResult(ToolResult):
 class EmailActionResult(ToolResult):
     email_ids: list[str] = Field(default_factory=list)
     count: int = 0
+
+
+class DownloadAttachmentResult(BaseModel):
+    """Result of the secure inbound-attachment pipeline.
+
+    ``status`` is ``ok`` only when every security layer passed and the file is
+    stored; ``blocked`` when a layer rejected it; ``pending_scan`` when the
+    antivirus was unavailable and nothing was stored (retry later).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "blocked", "error", "pending_scan"]
+    details: str | None = None
+    missing_configuration: list[str] = Field(default_factory=list)
+    email_id: str | None = None
+    part_id: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
+    scan_status: str | None = None
+    sender_trust: str | None = None
+    reject_reason: str | None = None
+    signed_url: str | None = None
+    signed_url_expires_at: datetime | None = None
+    text: str | None = None
+    text_offset: int = 0
+    next_offset: int | None = None
+    injection_flags: list[str] = Field(default_factory=list)

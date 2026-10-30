@@ -1,5 +1,6 @@
 import asyncio
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from email import policy
@@ -11,8 +12,38 @@ from urllib.parse import quote, unquote
 import aioimaplib
 
 from mcp_email_server.adapters.errors import AdapterConfigurationError, AdapterExecutionError
+from mcp_email_server.bodystructure import (
+    BodyPart,
+    attachments_from_bodystructure,
+    attachments_from_mime,
+    declarations_from_bodystructure,
+    declarations_from_mime,
+    extract_bodystructure_value,
+    parse_bodystructure,
+)
 from mcp_email_server.config import Settings
-from mcp_email_server.models import EmailContent, EmailMessage, EmailMetadata, MailboxInfo
+from mcp_email_server.models import AttachmentMetadata, EmailContent, EmailMessage, EmailMetadata, MailboxInfo
+
+
+@dataclass
+class AttachmentDeclaration:
+    """Attachment metadata enriched with the declared transfer encoding."""
+
+    metadata: AttachmentMetadata
+    encoding: str = ""
+
+
+@dataclass
+class AttachmentContext:
+    """Header-level facts about a message, needed before downloading any part."""
+
+    email_id: str
+    mailbox: str
+    uid: int
+    sender: str = ""
+    subject: str = ""
+    authentication_results: str | None = None
+    attachments: list[AttachmentDeclaration] = field(default_factory=list)
 
 
 class ImapAdapter:
@@ -22,6 +53,8 @@ class ImapAdapter:
     UID_PATTERN = re.compile(rb"UID\s+(?P<uid>\d+)", re.IGNORECASE)
     MAILBOX_PATTERN = re.compile(r'"(?P<name>[^"]+)"\s*$')
     MESSAGE_ID_PATTERN = re.compile(r"<[^>]+>")
+    MAX_SEARCH_VALUE_LENGTH = 512
+    LITERAL_MINUS_MAX_BYTES = 4096
     FLAG_MAP = {
         "seen": r"\Seen",
         "flagged": r"\Flagged",
@@ -136,7 +169,7 @@ class ImapAdapter:
             total = len(ordered_message_numbers)
             page_slice = self._paginate_uids(ordered_message_numbers, page=page, page_size=page_size)
             emails = [
-                (await self._fetch_email_content(client, message_number=message_number, mailbox=selected_mailbox)).as_metadata()
+                await self._fetch_email_metadata(client, message_number=message_number, mailbox=selected_mailbox)
                 for message_number in page_slice
             ]
             return emails, total
@@ -175,7 +208,7 @@ class ImapAdapter:
             ordered_message_numbers = sorted(message_numbers, reverse=True)
             page_slice = ordered_message_numbers[:page_size]
             emails = [
-                (await self._fetch_email_content(client, message_number=message_number, mailbox=selected_mailbox)).as_metadata()
+                await self._fetch_email_metadata(client, message_number=message_number, mailbox=selected_mailbox)
                 for message_number in page_slice
             ]
             return emails, len(ordered_message_numbers)
@@ -363,27 +396,68 @@ class ImapAdapter:
             criteria.extend(["SINCE", since.strftime("%d-%b-%Y")])
         if before is not None:
             criteria.extend(["BEFORE", before.strftime("%d-%b-%Y")])
-        if subject:
-            criteria.extend(["HEADER", "Subject", subject])
-        if from_address:
-            criteria.extend(["HEADER", "From", from_address])
-        if to_address:
-            criteria.extend(["HEADER", "To", to_address])
-        if text_query:
-            criteria.extend(["TEXT", text_query])
+
+        needs_utf8 = False
+        for keys, value in (
+            (("HEADER", "Subject"), subject),
+            (("HEADER", "From"), from_address),
+            (("HEADER", "To"), to_address),
+            (("TEXT",), text_query),
+        ):
+            if value is None or not value.strip():
+                continue
+            token, is_utf8 = self._encode_search_string(client, value)
+            criteria.extend([*keys, token])
+            needs_utf8 = needs_utf8 or is_utf8
+
         if not criteria:
             criteria.append("ALL")
 
-        search_response = await client.search(*criteria, charset=None)
+        search_response = await client.search(*criteria, charset="UTF-8" if needs_utf8 else None)
         self._ensure_ok(search_response.result, "search emails", search_response.lines)
         return self._parse_search_uids(search_response.lines)
 
     async def _search_header_uids(self, client, header_name: str, header_value: str) -> list[int]:
         if not header_value.strip():
             return []
-        search_response = await client.search("HEADER", header_name, header_value, charset=None)
+        token, needs_utf8 = self._encode_search_string(client, header_value)
+        search_response = await client.search("HEADER", header_name, token, charset="UTF-8" if needs_utf8 else None)
         self._ensure_ok(search_response.result, f"search header {header_name}", search_response.lines)
         return self._parse_search_uids(search_response.lines)
+
+    @classmethod
+    def _encode_search_string(cls, client, value: str) -> tuple[str, bool]:
+        """Encode a SEARCH string argument safely.
+
+        ASCII values become RFC 3501 quoted strings. Non-ASCII values are sent as
+        RFC 7888 non-synchronizing literals (Dovecot rejects 8-bit data outside
+        literals) and require ``CHARSET UTF-8``. Returns ``(token, needs_utf8)``.
+        """
+
+        cleaned = value.strip()
+        if any(char in cleaned for char in "\r\n\x00"):
+            raise ValueError("search values must not contain line breaks or NUL characters")
+        if len(cleaned) > cls.MAX_SEARCH_VALUE_LENGTH:
+            raise ValueError(f"search values must be at most {cls.MAX_SEARCH_VALUE_LENGTH} characters")
+
+        if cleaned.isascii():
+            return cls._quote_imap_string(cleaned), False
+
+        encoded_size = len(cleaned.encode("utf-8"))
+        capabilities = cls._server_capabilities(client)
+        if "LITERAL+" in capabilities or ("LITERAL-" in capabilities and encoded_size <= cls.LITERAL_MINUS_MAX_BYTES):
+            return f"{{{encoded_size}+}}\r\n{cleaned}", True
+        return cls._quote_imap_string(cleaned), True
+
+    @staticmethod
+    def _quote_imap_string(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    @staticmethod
+    def _server_capabilities(client) -> set[str]:
+        protocol = getattr(client, "protocol", None)
+        capabilities = getattr(protocol, "capabilities", None) or set()
+        return {str(capability).upper() for capability in capabilities}
 
     async def _fetch_email_content(self, client, message_number: int, mailbox: str) -> EmailContent:
         fetch_response = await client.fetch(str(message_number), "(UID FLAGS BODY.PEEK[])")
@@ -402,6 +476,78 @@ class ImapAdapter:
         resolved_uid = self._extract_uid(fetch_response.lines) or uid
         flags = self._extract_flags(fetch_response.lines)
         return self._parse_email_content(uid=resolved_uid, mailbox=mailbox, message_bytes=message_bytes, flags=flags)
+
+    async def _fetch_email_metadata(self, client, message_number: int, mailbox: str) -> EmailMetadata:
+        fetch_response = await client.fetch(
+            str(message_number), "(UID FLAGS BODY.PEEK[HEADER] BODYSTRUCTURE)"
+        )
+        self._ensure_ok(fetch_response.result, f"fetch metadata {message_number}", fetch_response.lines)
+        header_bytes = self._extract_message_bytes(fetch_response.lines)
+        resolved_uid = self._extract_uid(fetch_response.lines)
+        if resolved_uid is None:
+            raise ValueError("FETCH response did not contain a UID")
+        flags = self._extract_flags(fetch_response.lines)
+        return self._parse_email_metadata(
+            uid=resolved_uid,
+            mailbox=mailbox,
+            header_bytes=header_bytes,
+            flags=flags,
+            fetch_lines=fetch_response.lines,
+        )
+
+    async def fetch_attachment_context(self, email_id: str, mailbox: str | None = None) -> AttachmentContext:
+        """Return header facts and attachment declarations without downloading parts."""
+
+        selected_mailbox, uid = self.parse_email_id(email_id, default_mailbox=mailbox or self.folder)
+        self._ensure_configured()
+        client = self._create_client()
+
+        try:
+            await self._login_and_select(client, selected_mailbox)
+            fetch_response = await client.uid(
+                "FETCH", str(uid), "(UID FLAGS BODY.PEEK[HEADER] BODYSTRUCTURE)"
+            )
+            self._ensure_ok(fetch_response.result, f"fetch attachment context {uid}", fetch_response.lines)
+            header_bytes = self._extract_message_bytes(fetch_response.lines)
+            parsed = BytesParser(policy=policy.default).parsebytes(header_bytes)
+            root = self._extract_bodystructure(fetch_response.lines)
+            if root is not None:
+                declarations = declarations_from_bodystructure(root)
+            else:
+                declarations = declarations_from_mime(parsed)
+
+            return AttachmentContext(
+                email_id=self.build_email_id(selected_mailbox, uid),
+                mailbox=selected_mailbox,
+                uid=uid,
+                sender=getaddresses(parsed.get_all("from", []))[0][1] if parsed.get_all("from", []) else "",
+                subject=self._decode_header_value(parsed.get("subject")),
+                authentication_results=self._top_authentication_results(parsed),
+                attachments=[
+                    AttachmentDeclaration(metadata=metadata, encoding=encoding)
+                    for metadata, encoding in declarations
+                ],
+            )
+        except (aioimaplib.AioImapException, asyncio.TimeoutError, ValueError) as exc:
+            raise AdapterExecutionError(f"IMAP fetch attachment context failed: {exc}") from exc
+        finally:
+            await self._safe_logout(client)
+
+    async def fetch_attachment_part_bytes(self, mailbox: str, uid: int, part_id: str) -> bytes:
+        """Download a single MIME part (still transfer-encoded) via BODY.PEEK[part]."""
+
+        self._ensure_configured()
+        client = self._create_client()
+
+        try:
+            await self._login_and_select(client, mailbox)
+            fetch_response = await client.uid("FETCH", str(uid), f"(BODY.PEEK[{part_id}])")
+            self._ensure_ok(fetch_response.result, f"fetch part {part_id} of uid {uid}", fetch_response.lines)
+            return self._extract_message_bytes(fetch_response.lines)
+        except (aioimaplib.AioImapException, asyncio.TimeoutError, ValueError) as exc:
+            raise AdapterExecutionError(f"IMAP fetch attachment part failed: {exc}") from exc
+        finally:
+            await self._safe_logout(client)
 
     @staticmethod
     def build_email_id(mailbox: str, uid: int) -> str:
@@ -536,32 +682,87 @@ class ImapAdapter:
     def _parse_email_content(self, uid: int, mailbox: str, message_bytes: bytes, flags: set[str]) -> EmailContent:
         parsed = BytesParser(policy=policy.default).parsebytes(message_bytes)
         plain_body, html_body = ImapAdapter._extract_bodies(parsed)
+        attachments = attachments_from_mime(parsed)
+
+        return EmailContent(
+            **self._metadata_kwargs(uid=uid, mailbox=mailbox, parsed=parsed, flags=flags),
+            has_attachments=bool(attachments) or any(True for _ in parsed.iter_attachments()),
+            attachments=attachments,
+            text_body=plain_body,
+            html_body=html_body,
+        )
+
+    def _parse_email_metadata(
+        self,
+        uid: int,
+        mailbox: str,
+        header_bytes: bytes,
+        flags: set[str],
+        fetch_lines: list[bytes | bytearray],
+    ) -> EmailMetadata:
+        parsed = BytesParser(policy=policy.default).parsebytes(header_bytes)
+        root = self._extract_bodystructure(fetch_lines)
+        if root is not None:
+            attachments = attachments_from_bodystructure(root)
+        else:
+            attachments = attachments_from_mime(parsed)
+
+        return EmailMetadata(
+            **self._metadata_kwargs(uid=uid, mailbox=mailbox, parsed=parsed, flags=flags),
+            has_attachments=bool(attachments),
+            attachments=attachments,
+        )
+
+    def _metadata_kwargs(self, uid: int, mailbox: str, parsed, flags: set[str]) -> dict:
         recipients = [address for _, address in getaddresses(parsed.get_all("to", []) + parsed.get_all("cc", [])) if address]
         subject = self._decode_header_value(parsed.get("subject"))
         received_at = None
         if parsed.get("date"):
             received_at = parsedate_to_datetime(parsed["date"])
 
-        return EmailContent(
-            email_id=self.build_email_id(mailbox, uid),
-            account_name=self.account_name,
-            uid=uid,
-            mailbox=mailbox,
-            message_id=parsed.get("message-id"),
-            in_reply_to=parsed.get("in-reply-to"),
-            references=_strip_or_none(parsed.get("references")),
-            subject=subject,
-            project_tag=self._extract_project_tag(subject),
-            from_address=getaddresses(parsed.get_all("from", []))[0][1] if parsed.get_all("from", []) else "",
-            to_addresses=recipients,
-            received_at=received_at,
-            seen=r"\Seen" in flags,
-            flagged=r"\Flagged" in flags,
-            answered=r"\Answered" in flags,
-            has_attachments=any(True for _ in parsed.iter_attachments()),
-            text_body=plain_body,
-            html_body=html_body,
-        )
+        return {
+            "email_id": self.build_email_id(mailbox, uid),
+            "account_name": self.account_name,
+            "uid": uid,
+            "mailbox": mailbox,
+            "message_id": parsed.get("message-id"),
+            "in_reply_to": parsed.get("in-reply-to"),
+            "references": _strip_or_none(parsed.get("references")),
+            "subject": subject,
+            "project_tag": self._extract_project_tag(subject),
+            "from_address": getaddresses(parsed.get_all("from", []))[0][1] if parsed.get_all("from", []) else "",
+            "to_addresses": recipients,
+            "received_at": received_at,
+            "seen": r"\Seen" in flags,
+            "flagged": r"\Flagged" in flags,
+            "answered": r"\Answered" in flags,
+            "auth_result": self._top_authentication_results(parsed),
+        }
+
+    @staticmethod
+    def _extract_bodystructure(fetch_lines: list[bytes | bytearray]) -> BodyPart | None:
+        for line in fetch_lines:
+            if not isinstance(line, (bytes, bytearray)):
+                continue
+            line_bytes = bytes(line)
+            if not ImapAdapter.FETCH_PREFIX_PATTERN.match(line_bytes):
+                continue
+            decoded = line_bytes.decode("utf-8", errors="ignore")
+            value = extract_bodystructure_value(decoded)
+            if value is None:
+                continue
+            return parse_bodystructure(value)
+        return None
+
+    @staticmethod
+    def _top_authentication_results(parsed) -> str | None:
+        # Only the topmost header is trustworthy: it was added by the final
+        # receiving server, while lower ones may be attacker-controlled.
+        headers = parsed.get_all("authentication-results", [])
+        if not headers:
+            return None
+        topmost = str(headers[0]).replace("\x00", "").strip()
+        return topmost or None
 
     @classmethod
     def _extract_related_message_ids(cls, email: EmailContent) -> list[str]:
