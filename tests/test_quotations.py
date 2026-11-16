@@ -512,8 +512,36 @@ def test_database_outage_before_reservation_does_not_send_or_leak_provider_error
     {"quoter_account": None}, {"quoter_account": "missing"},
     {"quoter_token": "replace-me"}, {"quoter_token": "short"},
     {"access_token": QUOTER_TOKEN}, {"poll_webhook_secret": QUOTER_TOKEN},
+    {"access_token_previous": QUOTER_TOKEN}, {"poll_webhook_secret_previous": QUOTER_TOKEN},
     {"smtp_starttls": False}, {"supabase_url": None},
 ])
 def test_invalid_quoter_configuration_fails_closed(overrides):
     with pytest.raises(ValueError):
         create_app(settings(**overrides))
+
+
+def test_previous_quoter_token_is_accepted_during_grace_period():
+    legacy = "legacy-quoter-credential-32-characters-long"
+    app, smtp, _ = app_with_fakes(settings(quoter_token_previous=legacy))
+    with TestClient(app) as client:
+        sent = client.post(PREFIX, headers={"Authorization": f"Bearer {legacy}"}, json=payload())
+        missing = client.get(
+            PREFIX + "/by-key", headers={"Authorization": f"Bearer {legacy}", "Idempotency-Key": "absent"}
+        )
+    assert sent.status_code == 200
+    assert sent.json()["state"] == "aceptado_por_smtp"
+    assert missing.status_code == 404
+    assert len(smtp.messages) == 1
+
+
+def test_previous_quoter_token_is_rejected_after_grace_deadline():
+    legacy = "legacy-quoter-credential-32-characters-long"
+    app, smtp, _ = app_with_fakes(settings(
+        quoter_token_previous=legacy, previous_tokens_expire_at="2000-01-01T00:00:00Z",
+    ))
+    with TestClient(app) as client:
+        current = client.post(PREFIX, headers=HEADERS, json=payload())
+        expired = client.post(PREFIX, headers={"Authorization": f"Bearer {legacy}"}, json=payload())
+    assert current.status_code == 200
+    assert expired.status_code == 401
+    assert len(smtp.messages) == 1

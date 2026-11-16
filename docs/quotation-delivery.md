@@ -36,6 +36,31 @@ Esto tambien aplica a clientes MCP existentes. Las herramientas MCP y sus
 argumentos no cambian, pero los clientes que dependian de handshake abierto o
 tokens en rutas deben migrar. Rotar los tokens que antes estuvieron en URLs.
 
+## Periodo de gracia al rotar credenciales
+
+Rotar un token invalida de inmediato al consumidor que conserve el anterior. Para
+rotar sin cortar el servicio se publica el valor viejo junto al vigente:
+
+| Variable | Ruta afectada |
+|---|---|
+| `MCP_EMAIL_ACCESS_TOKEN_PREVIOUS` | `/mcp` y metricas administrativas |
+| `MCP_EMAIL_POLL_WEBHOOK_SECRET_PREVIOUS` | `/tasks/poll` |
+| `MCP_EMAIL_QUOTER_TOKEN_PREVIOUS` | `/v1/quotation-emails*` |
+
+Cada variable acepta una lista separada por comas. Un token previo solo se
+compara contra la ruta de su propio rol: el previo administrativo nunca autoriza
+cotizaciones y el previo de cotizaciones nunca autoriza buzones. El token vigente
+se evalua primero y los previos solo si aquel no coincide.
+
+`MCP_EMAIL_PREVIOUS_TOKENS_EXPIRE_AT` (ISO-8601, por ejemplo
+`2026-11-06T23:59:59Z`) impone una caducidad global: pasada esa fecha los tokens
+previos se ignoran y solo vale la credencial vigente. Un valor invalido impide el
+arranque. Si la variable no se define, la gracia no caduca y debe retirarse a
+mano.
+
+Procedimiento: publicar vigente y previo, actualizar los consumidores, verificar
+`401` con el previo y eliminar entonces la variable previa.
+
 ## Contrato HTTP
 
 ### POST /v1/quotation-emails

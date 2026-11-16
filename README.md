@@ -22,6 +22,14 @@ Verificado el 2026-10-30 mediante Cloud Run y Secret Manager:
 | SMTP | `mail.meiklabs.com:465`, TLS implicito con validacion de certificado |
 | BCC obligatorio por defecto | `4452112@bcc.hubspot.com` |
 
+Cloud Run reserva la ruta exacta `/healthz` para sus propias sondas: una peticion
+externa a `GET /healthz` recibe un 404 HTML de Google Frontend, aunque la
+aplicacion responda. Para monitoreo externo usar cualquiera de estos alias, que
+devuelven `200` con `{"status":"ok"}`:
+
+- `GET https://mcp-email-server-y2eagv4zlq-uc.a.run.app/health`
+- `GET https://mcp-email-server-y2eagv4zlq-uc.a.run.app/healthz/` (con barra final)
+
 El proyecto activo de una sesion local de gcloud puede ser otro. Usar siempre
 `--project=summirizer --region=us-central1` al administrar este servicio.
 `partial-ivory-silverfish.fastmcp.app` **no es el servicio de correo** y no debe
@@ -46,6 +54,49 @@ Cloud Run admite invocacion publica para que la autenticacion independiente de
 la aplicacion llegue a las rutas de cotizaciones sin un gateway OAuth.
 Esto **no** abre los buzones: `/mcp` exige `MCP_EMAIL_ACCESS_TOKEN`, y polling
 exige su propio secreto. No sustituir esos secretos por el token QUOTER.
+
+### Consumidores de credenciales
+
+Cada secreto es independiente y cada uno tiene consumidores propios. Rotar uno
+solo invalida ese consumidor; nunca autentica a los otros.
+
+| Secreto | Ruta que autoriza | Consumidor a actualizar |
+|---|---|---|
+| `MCP_EMAIL_ACCESS_TOKEN` | `/mcp` | Conector `meik_mail` en Claude (usuario o admin de la organizacion) |
+| `MCP_EMAIL_POLL_WEBHOOK_SECRET` | `/tasks/poll` | Job `mcp-email-poll` de Cloud Scheduler (`X-Webhook-Secret`) |
+| `MCP_EMAIL_QUOTER_TOKEN` | `/v1/quotation-emails*` | `mcp_quoter` (`EMAIL_QUOTER_TOKEN` en su `.env`) |
+
+El codigo acepta un token anterior solo mientras se configura en la variable
+`*_PREVIOUS` correspondiente. Sin esa variable la credencial vieja se rechaza al
+instante; con ella se mantiene viva hasta que se retira o vence
+`MCP_EMAIL_PREVIOUS_TOKENS_EXPIRE_AT`. Un token previo nunca cruza de rol:
+`quoter_settings` rechaza ademas que cualquier credencial QUOTER coincida con el
+admin o el de polling
+([quotations.py](src/mcp_email_server/quotations.py)).
+
+### Diagnostico de rechazos en `/mcp`
+
+Cada `401` de `/mcp` deja una advertencia `mcp_auth_rejected` en Cloud Logging con
+el motivo y una huella del token recibido (SHA-256 truncado, nunca el valor):
+
+| Motivo | Significado |
+|---|---|
+| `missing_authorization_header` | El cliente no envia `Authorization` |
+| `unsupported_authorization_scheme` | Envia otro esquema (no `Bearer`) |
+| `empty_bearer_token` | `Bearer` sin valor |
+| `previous_token_expired` | Usa un token `*_PREVIOUS` con la gracia vencida |
+| `token_mismatch` | No coincide con el vigente ni con los de gracia |
+| `missing_configured_token` | La instancia no tiene token configurado |
+
+Al arrancar, `mcp_access_control` publica `token=<huella>` del token vigente y
+`mcp_previous_tokens_ignored` advierte cuando hay tokens previos que ya no se
+aceptan. Comparar la huella del rechazo con la del arranque distingue "el cliente
+tiene un token viejo" de "el token del servidor cambio", sin exponer secretos. El
+`401` incluye ademas `WWW-Authenticate: Bearer`.
+
+```powershell
+gcloud logging read 'resource.labels.service_name="mcp-email-server" AND "mcp_auth_rejected"' --project=summirizer --limit=20 --freshness=1d
+```
 
 [cloudbuild.yaml](cloudbuild.yaml) conserva variables y secretos existentes
 mediante `--update-env-vars` y `--update-secrets`, y mantiene configurados QUOTER
@@ -127,13 +178,62 @@ los permisos de la migracion: ejecutar tambien las consultas anteriores.
 
 ## Verificacion del 2026-10-30
 
-- Revision activa: `mcp-email-server-00022-vgw`, con 100% del trafico.
-- Token QUOTER rotado en Secret Manager; version anterior deshabilitada.
-  La credencial anterior devuelve `401` y la nueva con `{}` devuelve `422`.
+- Revision activa: `mcp-email-server-00026-tcc`, con 100% del trafico y el tag
+  `quotation-api-check` apuntando a la misma revision.
+- Periodo de gracia activo para el conector `meik_mail`: la version `1` del
+  secreto `mcp-email-access-token` esta habilitada y montada en
+  `MCP_EMAIL_ACCESS_TOKEN_PREVIOUS`, con vencimiento
+  `MCP_EMAIL_PREVIOUS_TOKENS_EXPIRE_AT=2026-11-06T23:59:59Z`.
+  Verificado: token vigente `200`, token en gracia `200`, token desconocido
+  `401`, metricas administrativas con el token en gracia `200`.
+- El token en gracia no cruza de rol: con el en `/v1/quotation-emails` se
+  obtiene `401`. QUOTER vigente `422`; QUOTER revocado `401`. Polling con el
+  secreto vigente `200` y con el revocado `401` (sin gracia configurada).
+- Token QUOTER rotado en Secret Manager; la version vigente es la `3` y las
+  versiones `1` y `2` estan deshabilitadas. Toda credencial anterior devuelve
+  `401` y la vigente con `{}` devuelve `422`.
+- Entorno sincronizado con el `.env` local: `MCP_EMAIL_ACCESS_TOKEN` (version 2
+  del secreto) y `MCP_EMAIL_POLL_WEBHOOK_SECRET` (version 3) ahora coinciden con
+  el entorno local y sus versiones anteriores quedaron deshabilitadas.
+  El handshake MCP con el token nuevo devuelve `200` y `/tasks/poll` con el
+  secreto nuevo devuelve `200`; las credenciales anteriores devuelven `401`.
+- `MCP_EMAIL_ENV` se mantiene deliberadamente en `production` aunque el `.env`
+  local diga `development`, para no desactivar la exigencia de
+  `MCP_EMAIL_ACCESS_TOKEN` al arrancar. `MCP_EMAIL_CLAMAV_URL` y
+  `MCP_EMAIL_IMAP_MAILBOX` se conservan porque el `.env` no las define.
+- Las variables `EMAIL_*` del `.env` corresponden a `mcp_quoter` y no se
+  despliegan en este servicio.
+
+### Incidente del 2026-10-30 14:53-14:56 (hora local)
+
+Causa confirmada en los logs HTTP de Cloud Run, no en la aplicacion:
+
+- 14:53 se creo la revision `00024-ckh` con `MCP_EMAIL_ACCESS_TOKEN` rotado y
+  `MCP_EMAIL_POLL_WEBHOOK_SECRET` rotado.
+- 14:54:58 y 14:56:12, cuatro `POST /mcp` con `userAgent=Claude-User`
+  respondieron `401`. Ese es el conector `meik_mail` de Claude, que conservaba
+  el token administrativo anterior. El correo de prueba nunca llego a SMTP
+  porque la peticion fue rechazada antes de entrar a la aplicacion.
+- 14:55:09 el job `mcp-email-poll` respondio `401`; se actualizo su header
+  `X-Webhook-Secret` y la corrida de las 15:01 volvio a `200`.
+- No hubo ninguna peticion a `/v1/quotation-emails` entre las 14:00 y las 15:00
+  salvo las de verificacion con `python-httpx`. El diagnostico de
+  `mcp_quoter` como `autenticacion_correo` no proviene de un 401 del servicio
+  de correo en ese momento.
+- Ultimas llamadas identificadas como `mcp_quoter` (`userAgent=node`)
+  respondieron `401` a las 12:52 y 13:05, cuando aun usaba un token QUOTER
+  anterior. Su `.env` local ya coincide con la version vigente.
+- Los dos secretos siguen siendo independientes; no hubo reemplazo de un
+  secreto compartido. El fallo fue por rotacion sin actualizar consumidores.
+- Mitigacion aplicada: se implemento el periodo de gracia descrito en
+  `docs/quotation-delivery.md` y se habilito para el token administrativo, de
+  modo que el conector `meik_mail` vuelve a operar mientras se reconecta.
+  El resto de rutas mantiene la validacion estricta.
+
 - Sin token o con token incorrecto: `401`. Clave inexistente: `404` con
   `quotation_attempt_not_found`, sin redireccion ni error OAuth.
 - QUOTER rechazado con `401` en MCP, polling y metricas administrativas.
-  El handshake MCP con la credencial administrativa sigue devolviendo `200`.
+  El handshake MCP con la credencial administrativa vigente devuelve `200`.
 - Dos POST concurrentes con una misma clave devolvieron el mismo intento:
   `56d5f658-8d44-405d-964c-9f8e03e99691`, con un duplicado evitado y estado
   `aceptado_por_smtp`. SMTP acepto el destinatario autorizado y el BCC obligatorio.

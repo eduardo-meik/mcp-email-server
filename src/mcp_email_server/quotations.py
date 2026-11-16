@@ -162,7 +162,12 @@ def quoter_settings(settings: Settings) -> Settings | None:
             raise ValueError("A non-placeholder MCP_EMAIL_QUOTER_TOKEN and a fixed account are required")
         return None
     token = settings.quoter_token.get_secret_value().strip()
-    if len(token) < 32 or token in {settings.resolved_access_token(), settings.resolved_poll_webhook_secret()}:
+    operational_credentials = set(settings.accepted_access_tokens()) | set(settings.accepted_poll_webhook_secrets())
+    if (
+        len(token) < 32
+        or token in operational_credentials
+        or set(settings.resolved_previous_quoter_tokens()) & operational_credentials
+    ):
         raise ValueError("MCP_EMAIL_QUOTER_TOKEN must be distinct and contain at least 32 characters")
     if not settings.quoter_account or not settings.quoter_account.strip():
         raise ValueError("MCP_EMAIL_QUOTER_ACCOUNT is required")

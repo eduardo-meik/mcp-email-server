@@ -21,13 +21,21 @@ logger = logging.getLogger(__name__)
 PREFIX = "/v1/quotation-emails"
 
 
+def _matches_any_token(provided: str, expected_tokens: tuple[str, ...]) -> bool:
+    matched = False
+    for expected in expected_tokens:
+        matched |= compare_digest(provided.encode(), expected.encode())
+    return matched
+
+
 class QuotationAccessGuard:
     def __init__(
         self, app: ASGIApp, token: str | None, max_bytes: int, max_concurrency: int,
-        upload_timeout: float = 30,
+        upload_timeout: float = 30, previous_tokens: tuple[str, ...] = (),
     ) -> None:
         self.app = app
         self.token = token
+        self.previous_tokens = tuple(previous_tokens)
         self.max_bytes = max_bytes
         self.max_concurrency = max_concurrency
         self.upload_timeout = upload_timeout
@@ -39,8 +47,10 @@ class QuotationAccessGuard:
             return
         headers = Headers(scope=scope)
         authorization = headers.get("authorization", "")
-        if not self.token or not authorization.startswith("Bearer ") or not compare_digest(
-            authorization[7:].encode(), self.token.encode()
+        if (
+            not self.token
+            or not authorization.startswith("Bearer ")
+            or not _matches_any_token(authorization[7:], (self.token, *self.previous_tokens))
         ):
             await JSONResponse({"detail": "Unauthorized"}, status_code=401)(scope, receive, send)
             return
@@ -99,7 +109,9 @@ def install_quotation_api(app: FastAPI, settings: Settings) -> None:
     selected_settings = quoter_settings(settings)
     token = settings.quoter_token.get_secret_value().strip() if selected_settings is not None else None
     app.add_middleware(
-        QuotationAccessGuard, token=token, max_bytes=settings.quotation_max_request_bytes,
+        QuotationAccessGuard, token=token,
+        previous_tokens=tuple(selected_settings.resolved_previous_quoter_tokens()) if selected_settings else (),
+        max_bytes=settings.quotation_max_request_bytes,
         max_concurrency=settings.quotation_concurrency, upload_timeout=settings.quotation_upload_timeout_seconds,
     )
     service = None if selected_settings is None else QuotationService(
@@ -155,10 +167,12 @@ def install_quotation_api(app: FastAPI, settings: Settings) -> None:
 
     @app.get("/internal/quotation-metrics")
     async def metrics(request: Request) -> dict:
-        expected = settings.resolved_access_token()
+        accepted = settings.accepted_access_tokens()
         authorization = request.headers.get("authorization", "")
-        if not expected or not authorization.startswith("Bearer ") or not compare_digest(
-            authorization[7:].encode(), expected.encode()
+        if (
+            not accepted
+            or not authorization.startswith("Bearer ")
+            or not _matches_any_token(authorization[7:], tuple(accepted))
         ):
             raise HTTPException(401, "Unauthorized")
         current = resolve_service(request)
