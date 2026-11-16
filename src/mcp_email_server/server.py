@@ -1,4 +1,7 @@
+import logging
+from collections.abc import Iterable
 from datetime import datetime
+from hashlib import sha256
 from secrets import compare_digest
 from typing import Annotated
 
@@ -31,6 +34,31 @@ from mcp_email_server.models import (
 )
 from mcp_email_server.services import EmailSyncService
 from mcp_email_server.quotation_api import install_quotation_api
+
+logger = logging.getLogger(__name__)
+
+_TOKEN_FINGERPRINT_LENGTH = 12
+
+
+def _configure_logging(settings: Settings) -> None:
+    """Route application logs to stdout; uvicorn only configures its own loggers."""
+    if logging.getLogger().handlers:
+        return
+    level = logging.getLevelNamesMapping().get(settings.log_level.strip().upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s %(message)s")
+
+
+def _token_fingerprint(token: str | None) -> str:
+    """Non-reversible token identifier so auth failures are traceable without exposing secrets."""
+    if not token:
+        return "none"
+    return sha256(token.encode()).hexdigest()[:_TOKEN_FINGERPRINT_LENGTH]
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    return authorization[7:].strip() or None
 
 
 def build_service(settings: Settings | None = None, account_name: str | None = None) -> EmailSyncService:
@@ -110,20 +138,65 @@ def _tokens_match(provided: str, expected: str) -> bool:
     return compare_digest(provided.encode(), expected.encode())
 
 
-def authorize_mcp_path(path: str, authorization: str | None, expected_token: str | None) -> str | None:
+def _matches_any_token(provided: str, expected_tokens: Iterable[str]) -> bool:
+    matched = False
+    for expected in expected_tokens:
+        matched |= _tokens_match(provided, expected)
+    return matched
+
+
+def _auth_rejection_reason(
+    authorization: str | None,
+    expected_token: str | None,
+    previous_tokens: Iterable[str] = (),
+    expired_tokens: Iterable[str] = (),
+) -> str:
+    """Classify why a request was rejected so production 401s can be diagnosed from logs."""
+    if expected_token is None:
+        return "missing_configured_token"
+    if not authorization:
+        return "missing_authorization_header"
+    if not authorization.startswith("Bearer "):
+        return "unsupported_authorization_scheme"
+    provided = authorization[7:].strip()
+    if not provided:
+        return "empty_bearer_token"
+    if _matches_any_token(provided, previous_tokens):
+        return "previous_token_accepted"
+    if _matches_any_token(provided, expired_tokens):
+        return "previous_token_expired"
+    return "token_mismatch"
+
+
+def authorize_mcp_path(
+    path: str,
+    authorization: str | None,
+    expected_token: str | None,
+    previous_tokens: Iterable[str] = (),
+) -> str | None:
     """Return the path to route to the MCP app, or None when the request is not authorized."""
     if path not in ("/mcp", "/mcp/") or expected_token is None:
         return None
-    if authorization and authorization.startswith("Bearer ") and _tokens_match(authorization[7:].strip(), expected_token):
-        return "/mcp/" if path == "/mcp" else path
+    if authorization and authorization.startswith("Bearer "):
+        provided = authorization[7:].strip()
+        if _tokens_match(provided, expected_token) or _matches_any_token(provided, previous_tokens):
+            return "/mcp/" if path == "/mcp" else path
 
     return None
 
 
 class McpAccessGuard:
-    def __init__(self, app: ASGIApp, expected_token: str | None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        expected_token: str | None,
+        previous_tokens: Iterable[str] = (),
+        expired_tokens: Iterable[str] = (),
+    ) -> None:
         self.app = app
         self.expected_token = expected_token
+        self.previous_tokens = tuple(previous_tokens)
+        self.expired_tokens = tuple(expired_tokens)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope.get("path", "")
@@ -131,13 +204,27 @@ class McpAccessGuard:
             await self.app(scope, receive, send)
             return
 
-        routed_path = authorize_mcp_path(path, Headers(scope=scope).get("authorization"), self.expected_token)
+        authorization = Headers(scope=scope).get("authorization")
+        routed_path = authorize_mcp_path(path, authorization, self.expected_token, self.previous_tokens)
         if routed_path is not None:
             await self._forward(scope, receive, send, routed_path)
             return
 
         if path in ("/mcp", "/mcp/"):
-            response = JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+            logger.warning(
+                "mcp_auth_rejected reason=%s path=%s provided_token=%s accepted_tokens=%d",
+                _auth_rejection_reason(
+                    authorization, self.expected_token, self.previous_tokens, self.expired_tokens
+                ),
+                path,
+                _token_fingerprint(_bearer_token(authorization)),
+                (1 if self.expected_token else 0) + len(self.previous_tokens),
+            )
+            response = JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         else:
             response = JSONResponse({"detail": "Not Found"}, status_code=status.HTTP_404_NOT_FOUND)
         await response(scope, receive, send)
@@ -145,9 +232,10 @@ class McpAccessGuard:
     async def _forward(self, scope: Scope, receive: Receive, send: Send, routed_path: str) -> None:
         await self.app({**scope, "path": routed_path, "raw_path": routed_path.encode()}, receive, send)
 
+
 def verify_poll_webhook_secret(settings: Settings, provided_secret: str | None) -> None:
-    expected_secret = settings.resolved_poll_webhook_secret()
-    if expected_secret is None or provided_secret is None or not _tokens_match(provided_secret, expected_secret):
+    accepted_secrets = settings.accepted_poll_webhook_secrets()
+    if not accepted_secrets or provided_secret is None or not _matches_any_token(provided_secret, accepted_secrets):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing webhook secret.",
@@ -469,8 +557,26 @@ def build_mcp_server(settings: Settings | None = None) -> FastMCP:
     return server
 
 
+def _log_access_control_state(settings: Settings, accepted_previous_tokens: list[str]) -> None:
+    configured_previous = settings.configured_previous_access_tokens()
+    ignored = len(configured_previous) - len(accepted_previous_tokens)
+    logger.info(
+        "mcp_access_control token=%s grace_tokens=%d ignored_tokens=%d",
+        _token_fingerprint(settings.resolved_access_token()),
+        len(accepted_previous_tokens),
+        ignored,
+    )
+    if ignored > 0:
+        logger.warning(
+            "mcp_previous_tokens_ignored deadline=%s count=%d",
+            settings.previous_tokens_expire_at,
+            ignored,
+        )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     runtime_settings = settings or get_settings()
+    _configure_logging(runtime_settings)
     if runtime_settings.env.strip().lower() in {"production", "prod"} and runtime_settings.resolved_access_token() is None:
         raise ValueError("MCP_EMAIL_ACCESS_TOKEN is required in production and must not be a placeholder")
     mcp_server = build_mcp_server(runtime_settings)
@@ -478,12 +584,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     fastapi_app = FastAPI(title=runtime_settings.app_name, lifespan=mcp_http_app.lifespan)
 
-    fastapi_app.add_middleware(McpAccessGuard, expected_token=runtime_settings.resolved_access_token())
+    accepted_previous_tokens = runtime_settings.resolved_previous_access_tokens()
+    fastapi_app.add_middleware(
+        McpAccessGuard,
+        expected_token=runtime_settings.resolved_access_token(),
+        previous_tokens=accepted_previous_tokens,
+        expired_tokens=runtime_settings.configured_previous_access_tokens(),
+    )
+    _log_access_control_state(runtime_settings, accepted_previous_tokens)
     install_quotation_api(fastapi_app, runtime_settings)
 
     @fastapi_app.get("/healthz", response_model=ServiceHealth)
     @fastapi_app.get("/healthz/", response_model=ServiceHealth, include_in_schema=False)
+    @fastapi_app.get("/health", response_model=ServiceHealth, include_in_schema=False)
+    @fastapi_app.get("/health/", response_model=ServiceHealth, include_in_schema=False)
     async def healthz(account_name: str | None = None) -> ServiceHealth:
+        """Liveness probe. ``/health`` is the alias the Cloud Run edge does not shadow."""
         return build_service_health(runtime_settings, account_name=account_name)
 
     @fastapi_app.post("/tasks/poll", response_model=SyncRunResult)

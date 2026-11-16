@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -141,6 +142,66 @@ def test_guard_leaves_healthz_open_and_never_leaks_the_token() -> None:
     assert "s3cret-token" not in rejected.text
 
 
+def test_unauthorized_response_advertises_a_bearer_challenge() -> None:
+    with _guarded_client() as client:
+        response = client.post("/mcp", headers=MCP_HEADERS, json=TOOL_CALL_REQUEST)
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+def test_auth_failure_reasons_are_logged_without_the_token(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="mcp_email_server.server")
+
+    with _guarded_client() as client:
+        client.post("/mcp", headers=MCP_HEADERS, json=TOOL_CALL_REQUEST)
+        client.post(
+            "/mcp",
+            headers={**MCP_HEADERS, "Authorization": "Bearer wrong-token"},
+            json=TOOL_CALL_REQUEST,
+        )
+
+    assert "reason=missing_authorization_header" in caplog.text
+    assert "provided_token=none" in caplog.text
+    assert "reason=token_mismatch" in caplog.text
+    assert "accepted_tokens=1" in caplog.text
+    assert "s3cret-token" not in caplog.text
+    assert "wrong-token" not in caplog.text
+
+
+def test_expired_previous_token_is_reported_as_expired(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="mcp_email_server.server")
+    app = create_app(Settings(
+        _env_file=None, access_token="current-token", access_token_previous="legacy-token",
+        previous_tokens_expire_at="2000-01-01T00:00:00Z",
+    ))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            headers={**MCP_HEADERS, "Authorization": "Bearer legacy-token"},
+            json=INITIALIZE_REQUEST,
+        )
+
+    assert response.status_code == 401
+    assert "mcp_previous_tokens_ignored" in caplog.text
+    assert "reason=previous_token_expired" in caplog.text
+    assert "legacy-token" not in caplog.text
+
+
+def test_health_alias_is_available_for_external_probes() -> None:
+    app = create_app(Settings(_env_file=None))
+
+    with TestClient(app) as client:
+        alias = client.get("/health")
+        alias_slash = client.get("/health/")
+        canonical = client.get("/healthz/")
+
+    assert [r.status_code for r in (alias, alias_slash, canonical)] == [200, 200, 200]
+    assert alias.json() == canonical.json()
+
+
 def test_mcp_server_registers_mvp_mailbox_tools() -> None:
     tool_names = {tool.name for tool in asyncio.run(build_mcp_server().list_tools())}
 
@@ -267,6 +328,74 @@ def test_tasks_poll_accepts_requests_with_valid_secret(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["last_uid"] == 9
+
+
+def test_tasks_poll_accepts_previous_secret_during_grace_period(monkeypatch) -> None:
+    class DummyService:
+        async def sync_unread_emails(self, limit: int) -> SyncRunResult:
+            return SyncRunResult(status="ok", fetched=1, embedded=1, persisted=1, last_uid=limit)
+
+    def fake_build_service(settings: Settings | None = None, account_name: str | None = None) -> DummyService:
+        _ = (settings, account_name)
+        return DummyService()
+
+    monkeypatch.setattr("mcp_email_server.server.build_service", fake_build_service)
+
+    app = create_app(Settings(
+        _env_file=None, poll_batch_size=4, poll_webhook_secret="current-secret",
+        poll_webhook_secret_previous="legacy-secret",
+    ))
+
+    with TestClient(app) as client:
+        current = client.post("/tasks/poll", headers={"X-Webhook-Secret": "current-secret"})
+        previous = client.post("/tasks/poll", headers={"X-Webhook-Secret": "legacy-secret"})
+        unknown = client.post("/tasks/poll", headers={"X-Webhook-Secret": "unknown-secret"})
+
+    assert (current.status_code, previous.status_code, unknown.status_code) == (200, 200, 401)
+
+
+def test_previous_admin_token_is_accepted_during_grace_period() -> None:
+    app = create_app(Settings(
+        _env_file=None, access_token="current-token", access_token_previous="legacy-token",
+    ))
+
+    with TestClient(app) as client:
+        current = client.post(
+            "/mcp", headers={**MCP_HEADERS, "Authorization": "Bearer current-token"}, json=INITIALIZE_REQUEST
+        )
+        previous = client.post(
+            "/mcp", headers={**MCP_HEADERS, "Authorization": "Bearer legacy-token"}, json=INITIALIZE_REQUEST
+        )
+        unknown = client.post(
+            "/mcp", headers={**MCP_HEADERS, "Authorization": "Bearer unknown-token"}, json=INITIALIZE_REQUEST
+        )
+
+    assert (current.status_code, previous.status_code, unknown.status_code) == (200, 200, 401)
+
+
+def test_previous_admin_token_is_rejected_after_grace_deadline() -> None:
+    app = create_app(Settings(
+        _env_file=None, access_token="current-token", access_token_previous="legacy-token",
+        previous_tokens_expire_at="2000-01-01T00:00:00Z",
+    ))
+
+    with TestClient(app) as client:
+        current = client.post(
+            "/mcp", headers={**MCP_HEADERS, "Authorization": "Bearer current-token"}, json=INITIALIZE_REQUEST
+        )
+        previous = client.post(
+            "/mcp", headers={**MCP_HEADERS, "Authorization": "Bearer legacy-token"}, json=INITIALIZE_REQUEST
+        )
+
+    assert (current.status_code, previous.status_code) == (200, 401)
+
+
+def test_invalid_grace_deadline_fails_closed() -> None:
+    with pytest.raises(ValueError, match="MCP_EMAIL_PREVIOUS_TOKENS_EXPIRE_AT"):
+        create_app(Settings(
+            _env_file=None, access_token="current-token", access_token_previous="legacy-token",
+            previous_tokens_expire_at="not-a-timestamp",
+        ))
 
 
 def test_tasks_poll_syncs_all_configured_accounts_when_account_name_is_omitted(monkeypatch) -> None:

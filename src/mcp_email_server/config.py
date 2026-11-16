@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -65,6 +66,10 @@ class Settings(BaseSettings):
     access_token: SecretStr | None = None
     quoter_token: SecretStr | None = None
     quoter_account: str | None = None
+    access_token_previous: SecretStr | None = None
+    poll_webhook_secret_previous: SecretStr | None = None
+    quoter_token_previous: SecretStr | None = None
+    previous_tokens_expire_at: str | None = None
     quotation_max_request_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
     quotation_max_file_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=15 * 1024 * 1024)
     quotation_max_total_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
@@ -312,6 +317,48 @@ class Settings(BaseSettings):
         if self._is_missing_secret(self.access_token):
             return None
         return self.access_token.get_secret_value().strip()
+
+    def previous_tokens_grace_active(self) -> bool:
+        """Previous credentials are only honoured before the configured deadline."""
+        raw = self.previous_tokens_expire_at
+        if raw is None or not raw.strip():
+            return True
+        try:
+            deadline = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("MCP_EMAIL_PREVIOUS_TOKENS_EXPIRE_AT must be an ISO-8601 timestamp") from exc
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < deadline
+
+    def _previous_tokens(self, value: SecretStr | None) -> list[str]:
+        if self._is_missing_secret(value) or not self.previous_tokens_grace_active():
+            return []
+        return [token.strip() for token in value.get_secret_value().split(",") if token.strip()]
+
+    def resolved_previous_access_tokens(self) -> list[str]:
+        return self._previous_tokens(self.access_token_previous)
+
+    def configured_previous_access_tokens(self) -> list[str]:
+        """Previous access tokens ignoring the grace deadline (diagnostics only)."""
+        if self._is_missing_secret(self.access_token_previous):
+            return []
+        return [token.strip() for token in self.access_token_previous.get_secret_value().split(",") if token.strip()]
+
+    def resolved_previous_poll_webhook_secrets(self) -> list[str]:
+        return self._previous_tokens(self.poll_webhook_secret_previous)
+
+    def resolved_previous_quoter_tokens(self) -> list[str]:
+        return self._previous_tokens(self.quoter_token_previous)
+
+    def accepted_access_tokens(self) -> list[str]:
+        """Current token first, then grace tokens still inside their window."""
+        current = self.resolved_access_token()
+        return ([current] if current else []) + self.resolved_previous_access_tokens()
+
+    def accepted_poll_webhook_secrets(self) -> list[str]:
+        current = self.resolved_poll_webhook_secret()
+        return ([current] if current else []) + self.resolved_previous_poll_webhook_secrets()
 
     def _default_account_config(self) -> EmailAccountConfig:
         return EmailAccountConfig(
